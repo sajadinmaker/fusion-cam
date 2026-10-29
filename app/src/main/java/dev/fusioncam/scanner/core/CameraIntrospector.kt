@@ -225,9 +225,4 @@ object CameraIntrospector {
         characteristics: CameraCharacteristics,
         key: CameraCharacteristics.Key<IntArray>,
     ): IntArray? = runCatching { characteristics.get(key) }.getOrNull()
-
-    private fun boolArrayValue(
-        characteristics: CameraCharacteristics,
-        key: CameraCharacteristics.Key<BooleanArray>,
-    ): BooleanArray? = runCatching { characteristics.get(key) }.getOrNull()
 }
