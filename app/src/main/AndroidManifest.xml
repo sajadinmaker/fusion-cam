@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- The scanner only reads CameraCharacteristics, which does not require
+         the CAMERA permission on most devices, but declaring it lets us probe
+         everything in one pass and matches what the capture engine will need. -->
+    <uses-feature android:name="android.hardware.camera2" android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:label="Fusion Cam · Capability Scanner"
+        android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
