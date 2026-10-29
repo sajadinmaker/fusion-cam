@@ -30,6 +30,27 @@ A full JSON report lands in
 `Android/data/dev.fusioncam.scanner/files/reports/capabilities-<ts>.json`
 for the tuning database.
 
+## Phase 1 — capture skeleton ✅
+
+`ui.CaptureActivity` + `capture.CaptureEngine` prove the ZSL capture loop:
+
+- Repeating (preview + RAW_SENSOR) session; the `ImageReader` **is** the rolling
+  buffer — frames queue up without copies and drain in one shot on latch
+- Queue depth adapts to sensor size (50MP sensors → depth 2, ≤12MP → 4)
+- Latch flow: `stopRepeating()` → settle 250 ms → drain all buffered frames —
+  the "photo taken just before the tap" rank-by-sharpness trick
+- Sharpness proxy: variance of Bayer-**green** Laplacian (±2 pixel steps preserve
+  Bayer parity so neighbors are always same-channel)
+- Every drained frame pairs with its `TotalCaptureResult` by `SENSOR_TIMESTAMP`;
+  metadata dumped to `frames.json`: exposure/ISO, AE/AF state, noise profile,
+  dynamic black level, neutral color point, 3×3 color transform, focus distance
+- Sharpest frame saved as `best.dng` via `DngCreator` (characteristics + result),
+  the same shape an eventual ProRAW-style linear export needs
+
+Known skeleton limitations (Phase 2 targets): RAW fps is measured but not
+scripted (no per-frame exposure bracketing yet); no semantic per-region
+processing; RAW-only preview fallback is untested on LEGACY devices.
+
 ## Building
 
 ```
@@ -53,7 +74,8 @@ Phase 1 introduces CameraX.
 ## Roadmap
 
 1. Phase 0 — capability matrix + device scoring ✅
-2. Phase 1 — capture skeleton: ZSL preview, single RAW snapshot, metadata dump
+2. Phase 1 — capture skeleton: ZSL preview + rolling RAW buffer, sharpest-frame
+   latch → `best.dng` + `frames.json` ✅ (needs on-device smoke test)
 3. Phase 2 — HDR+ core: align-and-merge in C++/Halide over RAW bursts
 4. Phase 3 — GPU (Vulkan compute/Halide GPU target), < 1.5 s/photo
 5. Phase 4 — night mode (motion-masked long-merge)

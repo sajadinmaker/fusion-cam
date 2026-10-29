@@ -13,6 +13,9 @@
         android:label="Fusion Cam · Capability Scanner"
         android:theme="@android:style/Theme.Material.Light.DarkActionBar">
         <activity
+            android:name=".ui.CaptureActivity"
+            android:exported="false" />
+        <activity
             android:name=".ui.MainActivity"
             android:exported="true">
             <intent-filter>

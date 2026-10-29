@@ -23,6 +23,7 @@ class MainActivity : Activity() {
 
     private lateinit var statusLine: android.widget.TextView
     private lateinit var container: android.widget.LinearLayout
+    private var lastResultBest: dev.fusioncam.scanner.model.CameraProfile? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -50,6 +51,21 @@ class MainActivity : Activity() {
         column.addView(scanButton, android.widget.LinearLayout.LayoutParams(
             android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT
         ).also { it.topMargin = dp(16) })
+
+        val captureButton = android.widget.Button(this).apply {
+            text = "Phase 1 · capture test"
+            setOnClickListener {
+                val best = lastResultBest
+                if (best == null) {
+                    statusLine.text = "Scan first to pick a camera."
+                } else {
+                    startActivity(
+                        android.content.Intent(this@MainActivity, CaptureActivity::class.java)
+                            .putExtra(CaptureActivity.EXTRA_CAMERA_ID, best.cameraId)
+                    )
+                }
+            }
+        }
 
         statusLine = android.widget.TextView(this).apply { text = "Idle." }
         column.addView(statusLine)
@@ -79,6 +95,7 @@ class MainActivity : Activity() {
     }
 
     private fun render(result: ScanResult) {
+        lastResultBest = result.bestCamera
         val best = result.bestCamera
         val bestTier = result.bestTier
         statusLine.text = buildString {
