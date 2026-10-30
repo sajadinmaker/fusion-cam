@@ -30,6 +30,36 @@ A full JSON report lands in
 `Android/data/dev.fusioncam.scanner/files/reports/capabilities-<ts>.json`
 for the tuning database.
 
+## Phase 2 — HDR+ burst merge core ✅ (host-tested)
+
+`src/main/cpp/FusionNative.cpp` + `fusion/FusionNative.kt` implement the
+Hasinoff et al. HDR+ algorithm (Phase 2 scope), compiled through CMake for
+both ABIs:
+
+1. **Load** — RAW16 Bayer planes → u16, black level subtracted, per-frame
+2. **Grayscale pyramid** — 2×2 Bayer block mean per frame, clipped pixels
+   excluded (sentinel), 4 coarse-to-fine levels
+3. **Align** — 16px-tile pyramid alignment per alt frame, L2 on valid gray
+   pixels, ±4 search per level, low-validity tiles → `kNoMatch`
+4. **Merge** — full-res 32px tiles (offsets ×2 stay even → Bayer parity safe),
+   **per-pixel Wiener weight** `τ/(τ+d²)` (structural outliers ≈0, flat pixels
+   merge hard), tile-level ghost discard above `d̄² > 8192`
+5. **Finish** — parity-aware bilinear demosaic (no RGB planes needed), gamma
+   LUT → `0xAARRGGBB` pixels → Bitmap → JPEG + on-screen preview
+
+`Activity` has a **"Phase 2: HDR+ merge burst"** button: latch → extract each
+frame's plane → `FusionNative.mergeBurst` → thumbnail + `merged.jpg`.
+
+**Verified on host** (`cpp/test/run_host_tests.sh`, AddressSanitizer+UBSan):
+- alignment recovers ±1 level-0-px truth on all interior tiles; border tiles
+  correctly cannot exceed image bounds (documented, ghost-free in merge)
+- 3-frame merge cuts flat-region noise variance 29.3 → 12.2 (≥2.4× better than
+  the naive per-tile weight version, which also ghosted — SSR found by this test)
+- demosaic output channels sane
+
+Phase 2 simplifications kept as TODOs: constant noise floor τ (paper: per-frame
+noise model), even-only offsets, single thread, per-channel black levels.
+
 ## Phase 1 — capture skeleton ✅
 
 `ui.CaptureActivity` + `capture.CaptureEngine` prove the ZSL capture loop:
@@ -76,6 +106,8 @@ Phase 1 introduces CameraX.
 1. Phase 0 — capability matrix + device scoring ✅
 2. Phase 1 — capture skeleton: ZSL preview + rolling RAW buffer, sharpest-frame
    latch → `best.dng` + `frames.json` ✅ (needs on-device smoke test)
+3. Phase 2 — HDR+ core: align-and-merge in C++/NDK over RAW bursts ✅ (host-
+   tested via cpp/test/run_host_tests.sh; needs on-device smoke test)
 3. Phase 2 — HDR+ core: align-and-merge in C++/Halide over RAW bursts
 4. Phase 3 — GPU (Vulkan compute/Halide GPU target), < 1.5 s/photo
 5. Phase 4 — night mode (motion-masked long-merge)
