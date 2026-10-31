@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CaptureResult
 import android.media.ImageReader
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
@@ -197,19 +198,25 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
 
         val blackLevelPattern = characteristics
             .get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
-        val blArray = IntArray(4)
-        blackLevelPattern?.copyTo(blArray, 0)
-        // Phase 2 uses the mean of the 4 Bayer black levels; true per-channel
-        // levels are stored in frames.json and applied properly in Phase 3.
-        val blackLevel = (blArray[0] + blArray[1] + blArray[2] + blArray[3]) / 4
+        val blackLevels = IntArray(4).also { blackLevelPattern?.copyTo(it, 0) }
         val whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 4095
         val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
             ?: 0
 
-        onStatus("Merging ${planeBytes.size} frames (${w}x$h, cfa=$cfa, black=$blackLevel, white=$whiteLevel)…")
+        // White balance gains from the reference frame's CaptureResult
+        // (RggbChannelVector -> R, mean-of-greens, B).
+        val wbGains = best.result
+            ?.get(CaptureResult.COLOR_CORRECTION_GAINS)
+            ?.let { rgbv -> floatArrayOf(rgbv.red, (rgbv.greenEven + rgbv.greenOdd) / 2f, rgbv.blue) }
+            ?: floatArrayOf(1f, 1f, 1f)
+
+        onStatus("Merging ${planeBytes.size} frames (${w}x$h, cfa=$cfa, " +
+            "black=[${blackLevels.joinToString()}], white=$whiteLevel, " +
+            "wb=[${wbGains.joinToString { "%.2f".format(it) }}])…")
         val t0 = System.currentTimeMillis()
         val pixels = dev.fusioncam.scanner.fusion.FusionNative
-            .mergeBurst(planeBytes.toTypedArray(), refIndex, w, h, cfa, blackLevel, whiteLevel)
+            .mergeBurst(planeBytes.toTypedArray(), refIndex, w, h, cfa,
+                        blackLevels, whiteLevel, wbGains)
         val ms = System.currentTimeMillis() - t0
 
         val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)

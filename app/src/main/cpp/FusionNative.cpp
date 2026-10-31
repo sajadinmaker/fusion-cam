@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -33,6 +34,7 @@ constexpr float kTau = 256.0f;      // noise floor for the Wiener weight
 constexpr float kGhostDiscard = 8192.0f;
 constexpr u16 kInvalid = 0xFFFF;    // clipped sentinel in gray pyramids
 constexpr int16_t kNoMatch = INT16_MAX;
+constexpr int kBayerChannels = 4;   // R, G-even, G-odd, B
 
 void channelParities(int cfa, int out[4][2]) {
     switch (cfa) {
@@ -206,10 +208,10 @@ AlignOffsets align(const GrayPyramid& ref, const GrayPyramid& alt) {
 // A tile whose mean diff^2 explodes is additionally hard-discardged.
 void merge(const u16* ref, const std::vector<u16*>& alts,
            const std::vector<AlignOffsets>& offsets, int W, int H,
-           int clipThresh, u16* merged) {
+           int clipThresh, u16* merged, int tyBegin, int tyEnd) {
     const int tw = offsets.empty() ? 0 : offsets[0].tw;
     const int th = offsets.empty() ? 0 : offsets[0].th;
-    for (int ty = 0; ty < th; ty++) {
+    for (int ty = tyBegin; ty < tyEnd && ty < th; ty++) {
         for (int tx = 0; tx < tw; tx++) {
             const int ox = tx * kTile * 2, oy = ty * kTile * 2;
             if (ox + kTile * 2 > W || oy + kTile * 2 > H) continue;
@@ -265,19 +267,47 @@ void merge(const u16* ref, const std::vector<u16*>& alts,
     }
 }
 
-// Finish: parity-aware bilinear demosaic + gamma, one pass, no RGB planes.
+// Threaded driver: stripes the merge over tile rows, one stripe per worker.
+// Sharpness of the weight model is unchanged; workers write disjoint tile-row
+// bands of `merged`, so no synchronization is needed beyond the joins.
+void mergeThreaded(const u16* ref, const std::vector<u16*>& alts,
+                   const std::vector<AlignOffsets>& offsets, int W, int H,
+                   int clipThresh, u16* merged) {
+    const int th = offsets.empty() ? 0 : offsets[0].th;
+    if (th <= 0) return;
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int workers = static_cast<int>(
+        std::min<size_t>(std::max(hw, 1u), static_cast<size_t>(th)));
+    std::vector<std::thread> pool;
+    for (int t = 0; t < workers; t++) {
+        pool.emplace_back([&, t]() {
+            for (int ty = t; ty < th; ty += workers) {
+                merge(ref, alts, offsets, W, H, clipThresh, merged, ty, ty + 1);
+            }
+        });
+    }
+    for (auto& thr : pool) thr.join();
+}
+
+// Finish: parity-aware bilinear demosaic + WB gains + gamma, no RGB planes.
 // G is native at every green position; R/B fill from parity-derived neighbors.
+// wb[] holds per-channel gains (R, G, B); 1/1/1 = neutral. Applied pre-gamma.
 void finish(const u16* merged, int W, int H, int cfa, int clipRange,
-            jint* outPixels) {
+            const float wb[3], jint* outPixels) {
     int par[4][2];
     channelParities(cfa, par);
     const float norm = 1.0f / (clipRange > 0 ? clipRange : 1);
-    std::vector<jint> gammaLut(65536);
-    for (int v = 0; v < 65536; v++) {
-        const float x = std::min(v * norm, 1.0f);
-        gammaLut[v] = static_cast<jint>(std::pow(x, 1.0f / 2.2f) * 255.0f + 0.5f);
+    // One gamma LUT per output channel; entry v = gamma(clamp(v * wb[ch])).
+    std::vector<jint> gammaLut[3];
+    for (int ch = 0; ch < 3; ch++) {
+        gammaLut[ch].resize(65536);
+        for (int v = 0; v < 65536; v++) {
+            const float x = std::min(std::max(v * norm * wb[ch], 0.0f), 1.0f);
+            gammaLut[ch][v] = static_cast<jint>(std::pow(x, 1.0f / 2.2f) * 255.0f + 0.5f);
+        }
     }
-    auto gamma8 = [&gammaLut](u16 v) -> jint { return gammaLut[v]; };
+    // g: 0=R, 1=G, 2=B (wb index and LUT index coincide).
+    auto gamma8 = [&gammaLut](int g, u16 v) -> jint { return gammaLut[g][v]; };
 
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
@@ -288,9 +318,10 @@ void finish(const u16* merged, int W, int H, int cfa, int clipRange,
             if (px == par[0][0] && py == par[0][1]) nativeCh = 0;
             else if (px == par[3][0] && py == par[3][1]) nativeCh = 3;
             else nativeCh = 1; // green (both green parities)
+            const int nGain = (nativeCh == 0) ? 0 : (nativeCh == 3) ? 2 : 1;
 
             jint rr, gg, bb;
-            const jint g8 = gamma8(v);
+            const jint g8 = gamma8(nGain, v);
             if (nativeCh == 1) {
                 gg = g8;
                 jint fillSum[2] = {0, 0}; // index 0 -> R, 1 -> B
@@ -298,21 +329,22 @@ void finish(const u16* merged, int W, int H, int cfa, int clipRange,
                 for (int chIdx = 0; chIdx < 2; chIdx++) {
                     const int ch = (chIdx == 0) ? 0 : 3;
                     const int chx = static_cast<int>(par[ch][0]), chy = static_cast<int>(par[ch][1]);
+                    const int gain = (chIdx == 0) ? 0 : 2;
                     // Parity relation decides neighbor offsets.
                     const bool differX = (chx != px), differY = (chy != py);
                     if (differX && differY) {
-                        fillSum[chIdx] += gamma8(sampleClamped(merged, W, H, x - 1, y - 1)) +
-                                          gamma8(sampleClamped(merged, W, H, x + 1, y - 1)) +
-                                          gamma8(sampleClamped(merged, W, H, x - 1, y + 1)) +
-                                          gamma8(sampleClamped(merged, W, H, x + 1, y + 1));
+                        fillSum[chIdx] += gamma8(gain, sampleClamped(merged, W, H, x - 1, y - 1)) +
+                                          gamma8(gain, sampleClamped(merged, W, H, x + 1, y - 1)) +
+                                          gamma8(gain, sampleClamped(merged, W, H, x - 1, y + 1)) +
+                                          gamma8(gain, sampleClamped(merged, W, H, x + 1, y + 1));
                         fillCount[chIdx] = 4;
                     } else if (differX) {
-                        fillSum[chIdx] += gamma8(sampleClamped(merged, W, H, x - 1, y)) +
-                                          gamma8(sampleClamped(merged, W, H, x + 1, y));
+                        fillSum[chIdx] += gamma8(gain, sampleClamped(merged, W, H, x - 1, y)) +
+                                          gamma8(gain, sampleClamped(merged, W, H, x + 1, y));
                         fillCount[chIdx] = 2;
                     } else if (differY) {
-                        fillSum[chIdx] += gamma8(sampleClamped(merged, W, H, x, y - 1)) +
-                                          gamma8(sampleClamped(merged, W, H, x, y + 1));
+                        fillSum[chIdx] += gamma8(gain, sampleClamped(merged, W, H, x, y - 1)) +
+                                          gamma8(gain, sampleClamped(merged, W, H, x, y + 1));
                         fillCount[chIdx] = 2;
                     } else {
                         // Same parity as a non-green channel: we mis-typed the
@@ -324,38 +356,38 @@ void finish(const u16* merged, int W, int H, int cfa, int clipRange,
                 bb = fillCount[1] > 0 ? fillSum[1] / fillCount[1] : 0;
             } else if (nativeCh == 0) {
                 rr = g8;
-                gg = (gamma8(sampleClamped(merged, W, H, x - 1, y)) +
-                      gamma8(sampleClamped(merged, W, H, x + 1, y)) +
-                      gamma8(sampleClamped(merged, W, H, x, y - 1)) +
-                      gamma8(sampleClamped(merged, W, H, x, y + 1))) / 4;
+                gg = (gamma8(1, sampleClamped(merged, W, H, x - 1, y)) +
+                      gamma8(1, sampleClamped(merged, W, H, x + 1, y)) +
+                      gamma8(1, sampleClamped(merged, W, H, x, y - 1)) +
+                      gamma8(1, sampleClamped(merged, W, H, x, y + 1))) / 4;
                 const int chx = static_cast<int>(par[3][0]), chy = static_cast<int>(par[3][1]);
                 const bool dx = (chx != px), dy2 = (chy != py);
                 bb = (dx && dy2)
-                    ? (gamma8(sampleClamped(merged, W, H, x - 1, y - 1)) +
-                       gamma8(sampleClamped(merged, W, H, x + 1, y - 1)) +
-                       gamma8(sampleClamped(merged, W, H, x - 1, y + 1)) +
-                       gamma8(sampleClamped(merged, W, H, x + 1, y + 1))) / 4
-                    : (dx ? (gamma8(sampleClamped(merged, W, H, x - 1, y)) +
-                             gamma8(sampleClamped(merged, W, H, x + 1, y))) / 2
-                          : (gamma8(sampleClamped(merged, W, H, x, y - 1)) +
-                             gamma8(sampleClamped(merged, W, H, x, y + 1))) / 2);
+                    ? (gamma8(2, sampleClamped(merged, W, H, x - 1, y - 1)) +
+                       gamma8(2, sampleClamped(merged, W, H, x + 1, y - 1)) +
+                       gamma8(2, sampleClamped(merged, W, H, x - 1, y + 1)) +
+                       gamma8(2, sampleClamped(merged, W, H, x + 1, y + 1))) / 4
+                    : (dx ? (gamma8(2, sampleClamped(merged, W, H, x - 1, y)) +
+                             gamma8(2, sampleClamped(merged, W, H, x + 1, y))) / 2
+                          : (gamma8(2, sampleClamped(merged, W, H, x, y - 1)) +
+                             gamma8(2, sampleClamped(merged, W, H, x, y + 1))) / 2);
             } else {
                 bb = g8;
-                gg = (gamma8(sampleClamped(merged, W, H, x - 1, y)) +
-                      gamma8(sampleClamped(merged, W, H, x + 1, y)) +
-                      gamma8(sampleClamped(merged, W, H, x, y - 1)) +
-                      gamma8(sampleClamped(merged, W, H, x, y + 1))) / 4;
+                gg = (gamma8(1, sampleClamped(merged, W, H, x - 1, y)) +
+                      gamma8(1, sampleClamped(merged, W, H, x + 1, y)) +
+                      gamma8(1, sampleClamped(merged, W, H, x, y - 1)) +
+                      gamma8(1, sampleClamped(merged, W, H, x, y + 1))) / 4;
                 const int chx = static_cast<int>(par[0][0]), chy = static_cast<int>(par[0][1]);
                 const bool dx = (chx != px), dy2 = (chy != py);
                 rr = (dx && dy2)
-                    ? (gamma8(sampleClamped(merged, W, H, x - 1, y - 1)) +
-                       gamma8(sampleClamped(merged, W, H, x + 1, y - 1)) +
-                       gamma8(sampleClamped(merged, W, H, x - 1, y + 1)) +
-                       gamma8(sampleClamped(merged, W, H, x + 1, y + 1))) / 4
-                    : (dx ? (gamma8(sampleClamped(merged, W, H, x - 1, y)) +
-                             gamma8(sampleClamped(merged, W, H, x + 1, y))) / 2
-                          : (gamma8(sampleClamped(merged, W, H, x, y - 1)) +
-                             gamma8(sampleClamped(merged, W, H, x, y + 1))) / 2);
+                    ? (gamma8(0, sampleClamped(merged, W, H, x - 1, y - 1)) +
+                       gamma8(0, sampleClamped(merged, W, H, x + 1, y - 1)) +
+                       gamma8(0, sampleClamped(merged, W, H, x - 1, y + 1)) +
+                       gamma8(0, sampleClamped(merged, W, H, x + 1, y + 1))) / 4
+                    : (dx ? (gamma8(0, sampleClamped(merged, W, H, x - 1, y)) +
+                             gamma8(0, sampleClamped(merged, W, H, x + 1, y))) / 2
+                          : (gamma8(0, sampleClamped(merged, W, H, x, y - 1)) +
+                             gamma8(0, sampleClamped(merged, W, H, x, y + 1))) / 2);
             }
             outPixels[static_cast<size_t>(y) * W + x] =
                 (0xFF << 24) | (bb << 16) | (gg << 8) | rr;
@@ -370,19 +402,50 @@ void finish(const u16* merged, int W, int H, int cfa, int clipRange,
 extern "C" JNIEXPORT jintArray JNICALL
 Java_dev_fusioncam_scanner_fusion_FusionNative_mergeBurst(
         JNIEnv* env, jclass /*klass*/, jobjectArray frames, jint refIndex,
-        jint width, jint height, jint cfa, jint blackLevel, jint whiteLevel) {
+        jint width, jint height, jint cfa,
+        jintArray jBlackLevels, jint whiteLevel, jfloatArray jWbGains) {
 
     const int W = width, H = height;
     const size_t pixels = static_cast<size_t>(W) * H;
     const jint n = env->GetArrayLength(frames);
-    if (n < 2 || refIndex < 0 || refIndex >= n) { env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"), "need >=2 frames and a valid refIndex");
+    if (n < 2 || refIndex < 0 || refIndex >= n) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"),
+                      "need >=2 frames and a valid refIndex");
         return nullptr;
     }
-    const size_t bytesPerFrame =
-        static_cast<size_t>(W) * H * 2;
+    const size_t bytesPerFrame = static_cast<size_t>(W) * H * 2;
+
+    // Per-Bayer-position black levels (order R, G-even, G-odd, B);
+    // fall back to the scalar mean if the caller passed nothing.
+    jint blScalar[4] = {0, 0, 0, 0};
+    if (jBlackLevels != nullptr) {
+        if (env->GetArrayLength(jBlackLevels) != kBayerChannels) {
+            env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"),
+                          "blackLevels must have 4 entries");
+            return nullptr;
+        }
+        env->GetIntArrayRegion(jBlackLevels, 0, kBayerChannels, blScalar);
+    }
+    // White balance gains (R, G, B) applied in finish; 1/1/1 = none.
+    float wb[3] = {1.0f, 1.0f, 1.0f};
+    if (jWbGains != nullptr && env->GetArrayLength(jWbGains) == 3) {
+        jfloat* g = env->GetFloatArrayElements(jWbGains, nullptr);
+        for (int i = 0; i < 3; i++) wb[i] = g[i];
+        env->ReleaseFloatArrayElements(jWbGains, g, JNI_ABORT);
+    }
 
     // Load: little-endian bytes -> u16, black level subtracted at load.
     std::vector<std::vector<u16>> raws(static_cast<size_t>(n));
+    // Channel-this-pixel-belongs-to lookup, for per-position black levels.
+    int bl[4] = {static_cast<int>(blScalar[0]), static_cast<int>(blScalar[1]),
+                 static_cast<int>(blScalar[2]), static_cast<int>(blScalar[3])};
+    int par[4][2];
+    channelParities(cfa, par);
+    // Map parity -> {R, G-even, G-odd, B} black-level index.
+    int blIndexOfParity[2][2];
+    for (int ch = 0; ch < kBayerChannels; ch++) {
+        blIndexOfParity[par[ch][0]][par[ch][1]] = ch;
+    }
     for (jint i = 0; i < n; i++) {
         jbyteArray jbytes = static_cast<jbyteArray>(env->GetObjectArrayElement(frames, i));
         if (env->GetArrayLength(jbytes) < static_cast<jsize>(bytesPerFrame)) {
@@ -392,42 +455,67 @@ Java_dev_fusioncam_scanner_fusion_FusionNative_mergeBurst(
         }
         jbyte* src = env->GetByteArrayElements(jbytes, nullptr);
         raws[i].resize(pixels);
-        for (size_t p = 0; p < pixels; p++) {
-            const int lo = static_cast<unsigned char>(src[2 * p]);
-            const int hi = static_cast<unsigned char>(src[2 * p + 1]);
-            int v = (lo | (hi << 8)) - blackLevel;
-            raws[i][p] = static_cast<u16>(std::max(v, 0));
+        for (int y = 0; y < H; y++) {
+            const size_t rowBase = static_cast<size_t>(y) * W;
+            for (int x = 0; x < W; x++) {
+                const size_t p = rowBase + x;
+                const int lo = static_cast<unsigned char>(src[2 * p]);
+                const int hi = static_cast<unsigned char>(src[2 * p + 1]);
+                const int ch = blIndexOfParity[x & 1][y & 1];
+                const int v = (lo | (hi << 8)) - bl[ch];
+                raws[i][p] = static_cast<u16>(std::max(v, 0));
+            }
         }
         env->ReleaseByteArrayElements(jbytes, src, JNI_ABORT);
         env->DeleteLocalRef(jbytes);
     }
-    const int clipRange = std::max(whiteLevel - blackLevel, 1);
+    int minBl = bl[0];
+    int maxBl = bl[0];
+    for (int ch = 1; ch < kBayerChannels; ch++) {
+        minBl = std::min(minBl, bl[ch]);
+        maxBl = std::max(maxBl, bl[ch]);
+    }
+    const int clipRange = std::max(whiteLevel - minBl, 1);
     const int clipThresh = clipRange * 98 / 100;
 
-    // Align every alt onto the reference (ref keep aside).
+    // Align every alt onto the reference, one alt per worker thread.
     const u16* refPtr = raws[refIndex].data();
     GrayPyramid refGray = buildGray(refPtr, W, H, clipThresh);
-    std::vector<std::vector<u16>> altRaws(static_cast<size_t>(n - 1));
-    std::vector<AlignOffsets> offsets(static_cast<size_t>(n - 1));
-    std::vector<u16*> altPtrs(static_cast<size_t>(n - 1));
-    size_t k = 0;
-    for (jint i = 0; i < n; i++) {
+    const jint nAlt = n - 1;
+    std::vector<std::vector<u16>> altRaws(static_cast<size_t>(nAlt));
+    std::vector<AlignOffsets> offsets(static_cast<size_t>(nAlt));
+    std::vector<u16*> altPtrs(static_cast<size_t>(nAlt));
+    for (jint i = 0, k = 0; i < n; i++) {
         if (i == refIndex) continue;
         altRaws[k] = std::move(raws[i]);
         altPtrs[k] = altRaws[k].data();
-        GrayPyramid altGray = buildGray(altPtrs[k], W, H, clipThresh);
-        offsets[k] = align(refGray, altGray);
         k++;
     }
+    {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int workers = static_cast<int>(std::min<size_t>(
+            std::max(hw, 1u), static_cast<size_t>(nAlt)));
+        std::vector<std::thread> pool;
+        for (int t = 0; t < workers; t++) {
+            pool.emplace_back([&, t, nAlt]() {
+                for (int a = t; a < nAlt; a += workers) {
+                    GrayPyramid altGray = buildGray(altPtrs[a], W, H, clipThresh);
+                    offsets[a] = align(refGray, altGray);
+                }
+            });
+        }
+        for (auto& thr : pool) thr.join();
+    }
 
-    // Merge (merged pre-filled from ref; fusion overwrites tile by tile).
+    // Merge (merged pre-filled from ref; fusion overwrites tile by tile),
+    // striped over tile rows per worker.
     std::vector<u16> merged(raws[refIndex]); // copy of ref
-    merge(refPtr, altPtrs, offsets, W, H, clipThresh, merged.data());
+    mergeThreaded(refPtr, altPtrs, offsets, W, H, clipThresh, merged.data());
 
     // Finish to sRGB pixels.
     jintArray out = env->NewIntArray(static_cast<jsize>(pixels));
     std::vector<jint> pixelsBuf(pixels);
-    finish(merged.data(), W, H, cfa, clipRange, pixelsBuf.data());
+    finish(merged.data(), W, H, cfa, clipRange, wb, pixelsBuf.data());
     env->SetIntArrayRegion(out, 0, static_cast<jsize>(pixels), pixelsBuf.data());
     return out;
 }

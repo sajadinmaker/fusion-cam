@@ -30,6 +30,23 @@ A full JSON report lands in
 `Android/data/dev.fusioncam.scanner/files/reports/capabilities-<ts>.json`
 for the tuning database.
 
+## Phase 3 (CPU part) — color fidelity + multithreading ✅ (host-tested)
+
+- **Per-Bayer-position black levels**: `SENSOR_BLACK_LEVEL_PATTERN` (R, G-even,
+  G-odd, B) subtracted per pixel during load, instead of the scalar mean.
+  Clip range computed from min(black levels).
+- **White-balance gains**: R/G/B floats from the reference frame's
+  `CaptureResult.COLOR_CORRECTION_GAINS` (`RggbChannelVector` → mean of the two
+  greens), applied pre-gamma in `finish()` via per-channel gamma LUTs — one
+  LUT build, no per-pixel float math. Neutral 1/1/1 still accepted.
+- **Multithreaded**: align runs one alt frame per worker (`std::thread` pool,
+  hardware_concurrency-capped); merge stripes tile rows across workers
+  (disjoint writes, no locks). finish remains per-pixel sequential with LUT —
+  the cheap stage.
+- Host test extended: threaded merge keeps the 29.3 → 12.2 variance cut and
+  interior-tile alignment truth; new assertions prove WB gains land (R×2/B×0.5
+  warm render: R 228→255, B 237→173, G bit-identical).
+
 ## Phase 2 — HDR+ burst merge core ✅ (host-tested)
 
 `src/main/cpp/FusionNative.cpp` + `fusion/FusionNative.kt` implement the

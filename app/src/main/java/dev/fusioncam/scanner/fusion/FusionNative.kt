@@ -23,8 +23,9 @@ object FusionNative {
         width: Int,
         height: Int,
         cfa: Int,
-        blackLevel: Int,
+        blackLevels: IntArray,   // 4 entries: R, G-even, G-odd, B (RAW units)
         whiteLevel: Int,
+        wbGains: FloatArray,     // 3 entries: R, G, B (1/1/1 = neutral)
     ): IntArray
 
     /** Image plane 0 (RAW16) -> tightly packed little-endian byte buffer. */

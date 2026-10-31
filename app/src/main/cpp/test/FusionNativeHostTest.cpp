@@ -99,11 +99,11 @@ int main() {
     printf("interior tiles off-truth beyond ±1 level-0 px: %d / %zu\n", offBy2, (o1.dy.size() * 2 - o1.tw) * 2);
     if (offBy2 > 0) failures++;
 
-    // ---- 2. merge -----------------------------------------------------------
+    // ---- 2. merge (threaded driver, striped over tile rows) -------------------
     std::vector<u16> merged(ref); // pre-filled from ref, as in the JNI entry
     std::vector<u16*> alts = {alt1.data(), alt2.data()};
     std::vector<AlignOffsets> offs = {o1, o2};
-    merge(ref.data(), alts, offs, W, H, clipThresh, merged.data());
+    mergeThreaded(ref.data(), alts, offs, W, H, clipThresh, merged.data());
 
     auto variance = [&](const std::vector<u16>& img, int x0, int y0, int x1, int y1) {
         double sum = 0, sum2 = 0; long n = 0;
@@ -122,14 +122,31 @@ int main() {
     printf("noise variance: ref=%.1f merged=%.1f\n", varRef, varMerged);
     if (varMerged >= varRef * 0.75) { printf("FAIL: insufficient noise reduction\n"); failures++; }
 
-    // ---- 3. finish ----------------------------------------------------------
+    // ---- 3. finish (neutral WB) ----------------------------------------------
+    const float wbNeutral[3] = {1.0f, 1.0f, 1.0f};
     std::vector<jint> pixels(static_cast<size_t>(W) * H);
-    finish(merged.data(), W, H, 0 /*RGGB*/, kWhite - kBlack, pixels.data());
+    finish(merged.data(), W, H, 0 /*RGGB*/, kWhite - kBlack, wbNeutral,
+           pixels.data());
     size_t center = static_cast<size_t>(H / 2) * W + W / 2;
     jint c = pixels[center];
-    const int r = (c >> 0) & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
-    printf("finish center pixel R=%d G=%d B=%d (expect ~mid-gray, G>=R,B-20)\n", r, g, b);
-    if (r < 40 || g < 40 || b < 40 || r > 255 || g > 255 || b > 255) failures++;
+    const int r0 = (c >> 0) & 0xFF, g0 = (c >> 8) & 0xFF, b0 = (c >> 16) & 0xFF;
+    printf("finish neutral center pixel R=%d G=%d B=%d (expect ~mid-gray)\n",
+           r0, g0, b0);
+    if (r0 < 40 || g0 < 40 || b0 < 40 || r0 > 255 || g0 > 255 || b0 > 255)
+        failures++;
+
+    // ---- 4. WB gains are applied pre-gamma -----------------------------------
+    // Red x2 / blue x0.5 with the same merged data must visibly redden the
+    // image, and the green channel must be untouched by the red gain.
+    const float wbWarm[3] = {2.0f, 1.0f, 0.5f};
+    std::vector<jint> pixelsWarm(static_cast<size_t>(W) * H);
+    finish(merged.data(), W, H, 0, kWhite - kBlack, wbWarm, pixelsWarm.data());
+    jint cw = pixelsWarm[center];
+    const int rW = (cw >> 0) & 0xFF, gW = (cw >> 8) & 0xFF, bW = (cw >> 16) & 0xFF;
+    printf("finish warm center pixel R=%d G=%d B=%d (expect R>R0, B<B0, G==G0)\n",
+           rW, gW, bW);
+    if (!(rW >= r0 && bW < b0)) { printf("FAIL: WB gains not applied\n"); failures++; }
+    if (gW != g0) { printf("FAIL: green moved without a green gain\n"); failures++; }
 
     if (failures == 0) printf("\nALL PASS\n");
     else printf("\n%d FAILURES\n", failures);
