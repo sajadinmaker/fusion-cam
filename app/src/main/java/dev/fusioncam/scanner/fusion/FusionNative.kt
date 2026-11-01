@@ -26,6 +26,7 @@ object FusionNative {
         blackLevels: IntArray,   // 4 entries: R, G-even, G-odd, B (RAW units)
         whiteLevel: Int,
         wbGains: FloatArray,     // 3 entries: R, G, B (1/1/1 = neutral)
+        tauScale: Float,         // noise-floor scaler >= 1 (ISO/100)
     ): IntArray
 
     /** Image plane 0 (RAW16) -> tightly packed little-endian byte buffer. */

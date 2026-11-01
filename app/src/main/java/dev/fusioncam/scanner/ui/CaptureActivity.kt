@@ -210,13 +210,19 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
             ?.let { rgbv -> floatArrayOf(rgbv.red, (rgbv.greenEven + rgbv.greenOdd) / 2f, rgbv.blue) }
             ?: floatArrayOf(1f, 1f, 1f)
 
+        // Noise floor scales with the reference frame's ISO (variance grows
+        // with analog gain); floored at 1x so the model never under-merges at
+        // base ISO.
+        val iso = best.result?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
+        val tauScale = maxOf(1f, iso / 100f)
+
         onStatus("Merging ${planeBytes.size} frames (${w}x$h, cfa=$cfa, " +
             "black=[${blackLevels.joinToString()}], white=$whiteLevel, " +
-            "wb=[${wbGains.joinToString { "%.2f".format(it) }}])…")
+            "wb=[${wbGains.joinToString { "%.2f".format(it) }}], iso=$iso)…")
         val t0 = System.currentTimeMillis()
         val pixels = dev.fusioncam.scanner.fusion.FusionNative
             .mergeBurst(planeBytes.toTypedArray(), refIndex, w, h, cfa,
-                        blackLevels, whiteLevel, wbGains)
+                        blackLevels, whiteLevel, wbGains, tauScale)
         val ms = System.currentTimeMillis() - t0
 
         val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)

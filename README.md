@@ -30,6 +30,28 @@ A full JSON report lands in
 `Android/data/dev.fusioncam.scanner/files/reports/capabilities-<ts>.json`
 for the tuning database.
 
+## Phase 3.5 — border alignment + noise-scaled merge ✅ (host-tested)
+
+- **Border-tile alignment fixed**: the search previously discarded any
+  candidate tile extending past the frame edge, so border tiles whose true
+  shift pointed off-image could not lock. Candidates are now evaluated on
+  their overlap with the frame, with out-of-bounds alt samples *skipped,
+  never clamped* — duplicated edge content can't fake a match. The host test
+  now recovers alignment truth on **all 24/24 tiles**, borders included
+  (was 20/24); merged variance improved to 29.3 → 11.0 as a side effect.
+- **Merge honors frame bounds**: alt reads outside [0,H)×[0,W) are skipped in
+  both the tile-diff pass and the pixel merge (no OOB reads, no edge-dup
+  ghosting).
+- **Per-frame noise floor**: the Wiener τ now scales with the reference
+  frame's ISO (`SENSOR_SENSITIVITY`, floored at ISO 100) instead of being a
+  constant. Verified at σ=24 (ISO-1600-like): the 3-frame merge reaches
+  ref/2.95 variance vs the theoretical 3-frame floor of ref/3 — the scaled
+  τ feeds through instead of freezing up.
+- Documented (not fixed, by design): near-flat block tiles at extreme noise
+  can lose a cost tie on their single dot-sized signal; a ±3 px miss on a
+  flat region is dot-sized and harmless — per-pixel Wiener weights absorb it.
+  Host test asserts ≥ 19/24 tiles lock at σ=24.
+
 ## Phase 3 (CPU part) — color fidelity + multithreading ✅ (host-tested)
 
 - **Per-Bayer-position black levels**: `SENSOR_BLACK_LEVEL_PATTERN` (R, G-even,

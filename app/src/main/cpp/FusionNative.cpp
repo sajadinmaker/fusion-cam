@@ -153,21 +153,26 @@ AlignOffsets align(const GrayPyramid& ref, const GrayPyramid& alt) {
                 }
                 int bestDy = ody, bestDx = odx;
                 double bestCost = 1e18; int bestValid = 0;
-                // NOTE: border tiles whose true shift points off-image cannot
-                // evaluate their true offset here (clamped search would be the
-                // paper's exact treatment). Merge stays ghost-free for them via
-                // per-pixel weights. TODO Phase 3: clamped sub-pixel search.
+                // Border tiles: candidates whose alt tile extends past the
+                // frame are evaluated on their overlap with the image only.
+                // Out-of-bounds alt samples are skipped (never clamped), so
+                // duplicated-edge content cannot fake a match; the existing
+                // enough-valid guard rejects degenerate candidates.
                 for (int sy = ody - kSearch; sy <= ody + kSearch; sy++) {
                     for (int sx = odx - kSearch; sx <= odx + kSearch; sx++) {
                         const int ax = ox + sx, ay = oy + sy;
-                        if (ax < 0 || ay < 0 || ax + kTile > lw || ay + kTile > lh) continue;
                         double cost = 0.0; int valid = 0;
                         for (int cy = 0; cy < kTile; cy++) {
+                            const int ayRow = ay + cy;
+                            if (ayRow < 0 || ayRow >= lh) continue;
                             const size_t rbase = static_cast<size_t>(oy + cy) * lw;
+                            const size_t abase = static_cast<size_t>(ayRow) * lw;
                             for (int cx = 0; cx < kTile; cx++) {
+                                const int axCol = ax + cx;
+                                if (axCol < 0 || axCol >= lw) continue;
                                 const u16 rv = rl[rbase + ox + cx];
                                 if (rv == kInvalid) continue;
-                                const u16 av = sampleClamped(al.data(), lw, lh, ax + cx, ay + cy);
+                                const u16 av = al[abase + axCol];
                                 if (av == kInvalid) continue;
                                 const int d = static_cast<int>(rv) - static_cast<int>(av);
                                 cost += static_cast<double>(d) * d;
@@ -182,6 +187,10 @@ AlignOffsets align(const GrayPyramid& ref, const GrayPyramid& alt) {
                 }
                 const bool enoughValid = bestValid >= kTile * kTile / 4;
                 const size_t lidx = static_cast<size_t>(ty) * tw + tx;
+#ifdef ALIGN_DEBUG
+                printf("  align l=%d tile(%d,%d) grid=%dx%d o=(%d,%d) best=(%d,%d) cost=%.0f valid=%d thr=%d\n",
+                       l, tx, ty, tw, th, ody, odx, bestDy, bestDx, bestCost, bestValid, kTile * kTile / 4);
+#endif
                 if (enoughValid) {
                     gDy[l][lidx] = static_cast<int16_t>(bestDy);
                     gDx[l][lidx] = static_cast<int16_t>(bestDx);
@@ -206,9 +215,14 @@ AlignOffsets align(const GrayPyramid& ref, const GrayPyramid& alt) {
 // Flat/noisy pixels (|d| ~ noise) merge strongly; structural outliers
 // (misalignment, object motion, boundary crossings) merge ~never.
 // A tile whose mean diff^2 explodes is additionally hard-discardged.
+//
+// Border tiles may carry offsets that push the alt read out of the frame;
+// alt pixels outside [0,H)x[0,W) are skipped (never clamped), consistent
+// with the overlap-only alignment. `tau` is the per-pixel Wiener noise
+// floor in variance units — callers scale it for ISO/noise conditions.
 void merge(const u16* ref, const std::vector<u16*>& alts,
            const std::vector<AlignOffsets>& offsets, int W, int H,
-           int clipThresh, u16* merged, int tyBegin, int tyEnd) {
+           int clipThresh, float tau, u16* merged, int tyBegin, int tyEnd) {
     const int tw = offsets.empty() ? 0 : offsets[0].tw;
     const int th = offsets.empty() ? 0 : offsets[0].th;
     for (int ty = tyBegin; ty < tyEnd && ty < th; ty++) {
@@ -225,12 +239,16 @@ void merge(const u16* ref, const std::vector<u16*>& alts,
                 const int oyA = oy + pdy * 2, oxA = ox + pdx * 2;
                 double diff = 0.0; int valid = 0;
                 for (int cy = 0; cy < kTile * 2; cy++) {
+                    const int ay = oyA + cy;
+                    if (ay < 0 || ay >= H) continue;
                     const size_t rbase = static_cast<size_t>(oy + cy) * W;
-                    const size_t abase = static_cast<size_t>(oyA + cy) * W;
+                    const size_t abase = static_cast<size_t>(ay) * W;
                     for (int cx = 0; cx < kTile * 2; cx++) {
+                        const int axc = oxA + cx;
+                        if (axc < 0 || axc >= W) continue;
                         const u16 rv = ref[rbase + ox + cx];
                         if (rv >= clipThresh) continue;
-                        const u16 av = alts[a][abase + oxA + cx];
+                        const u16 av = alts[a][abase + axc];
                         if (av >= clipThresh) continue;
                         const int d = static_cast<int>(rv) - static_cast<int>(av);
                         diff += static_cast<double>(d) * d;
@@ -252,11 +270,13 @@ void merge(const u16* ref, const std::vector<u16*>& alts,
                         if (discard[a]) continue;
                         const int16_t pdy = offsets[a].dy[static_cast<size_t>(ty) * tw + tx];
                         const int16_t pdx = offsets[a].dx[static_cast<size_t>(ty) * tw + tx];
-                        const u16 av = alts[a][static_cast<size_t>(oy + cy + pdy * 2) * W +
-                                               ox + cx + pdx * 2];
+                        const int ay = oy + cy + pdy * 2;
+                        const int axc = ox + cx + pdx * 2;
+                        if (ay < 0 || ay >= H || axc < 0 || axc >= W) continue;
+                        const u16 av = alts[a][static_cast<size_t>(ay) * W + axc];
                         if (av >= clipThresh) continue;
                         const int d = static_cast<int>(rv) - static_cast<int>(av);
-                        const float w = kTau / (kTau + static_cast<float>(d) * d);
+                        const float w = tau / (tau + static_cast<float>(d) * d);
                         num += w * av;
                         den += w;
                     }
@@ -272,7 +292,7 @@ void merge(const u16* ref, const std::vector<u16*>& alts,
 // bands of `merged`, so no synchronization is needed beyond the joins.
 void mergeThreaded(const u16* ref, const std::vector<u16*>& alts,
                    const std::vector<AlignOffsets>& offsets, int W, int H,
-                   int clipThresh, u16* merged) {
+                   int clipThresh, float tau, u16* merged) {
     const int th = offsets.empty() ? 0 : offsets[0].th;
     if (th <= 0) return;
     const unsigned hw = std::thread::hardware_concurrency();
@@ -282,7 +302,7 @@ void mergeThreaded(const u16* ref, const std::vector<u16*>& alts,
     for (int t = 0; t < workers; t++) {
         pool.emplace_back([&, t]() {
             for (int ty = t; ty < th; ty += workers) {
-                merge(ref, alts, offsets, W, H, clipThresh, merged, ty, ty + 1);
+                merge(ref, alts, offsets, W, H, clipThresh, tau, merged, ty, ty + 1);
             }
         });
     }
@@ -403,7 +423,8 @@ extern "C" JNIEXPORT jintArray JNICALL
 Java_dev_fusioncam_scanner_fusion_FusionNative_mergeBurst(
         JNIEnv* env, jclass /*klass*/, jobjectArray frames, jint refIndex,
         jint width, jint height, jint cfa,
-        jintArray jBlackLevels, jint whiteLevel, jfloatArray jWbGains) {
+        jintArray jBlackLevels, jint whiteLevel, jfloatArray jWbGains,
+        jfloat tauScale) {
 
     const int W = width, H = height;
     const size_t pixels = static_cast<size_t>(W) * H;
@@ -433,6 +454,9 @@ Java_dev_fusioncam_scanner_fusion_FusionNative_mergeBurst(
         for (int i = 0; i < 3; i++) wb[i] = g[i];
         env->ReleaseFloatArrayElements(jWbGains, g, JNI_ABORT);
     }
+    // Per-frame Wiener noise floor: tau scales with ISO (variance roughly
+    // grows with gain). tauScale = 1 restores the Phase 2 constant model.
+    const float tau = kTau * std::max(tauScale, 1.0f);
 
     // Load: little-endian bytes -> u16, black level subtracted at load.
     std::vector<std::vector<u16>> raws(static_cast<size_t>(n));
@@ -510,7 +534,7 @@ Java_dev_fusioncam_scanner_fusion_FusionNative_mergeBurst(
     // Merge (merged pre-filled from ref; fusion overwrites tile by tile),
     // striped over tile rows per worker.
     std::vector<u16> merged(raws[refIndex]); // copy of ref
-    mergeThreaded(refPtr, altPtrs, offsets, W, H, clipThresh, merged.data());
+    mergeThreaded(refPtr, altPtrs, offsets, W, H, clipThresh, tau, merged.data());
 
     // Finish to sRGB pixels.
     jintArray out = env->NewIntArray(static_cast<jsize>(pixels));
