@@ -241,6 +241,7 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
 
         val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
         bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+        stampWatermark(bitmap)
         FileOutputStream(File(run, "merged.jpg")).use { out ->
             bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, out)
         }
@@ -250,6 +251,26 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
         val thumb = android.graphics.Bitmap.createScaledBitmap(bitmap, displayW, displayH, true)
         runOnUiThread { mergedPreviewView?.setImageBitmap(thumb) }
         onStatus("Merged in ${ms}ms · saved → ${File(run, "merged.jpg").absolutePath}")
+    }
+
+    /**
+     * Stamps every merged photo with the app watermark before it leaves the
+     * app for sharing: "fusioncam(sajadinmaker)". Scales with image width and
+     * carries a drop shadow so it stays legible on any scene.
+     */
+    private fun stampWatermark(bitmap: android.graphics.Bitmap) {
+        val wm = "fusioncam(sajadinmaker)"
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xC8FFFFFF.toInt() // white at ~78% opacity
+            textSize = bitmap.width / 26f
+            typeface = android.graphics.Typeface.create(
+                android.graphics.Typeface.SANS_SERIF, android.graphics.Typeface.BOLD)
+            setShadowLayer(bitmap.width / 180f, 0f, bitmap.width / 400f, 0xB3000000.toInt())
+        }
+        val pad = bitmap.width / 40f
+        val canvas = android.graphics.Canvas(bitmap)
+        val baseline = bitmap.height - pad - paint.fontMetrics.descent
+        canvas.drawText(wm, pad, baseline, paint)
     }
 
     private fun writeFramesJson(frames: List<CaptureEngine.LatchedFrame>, run: File) {

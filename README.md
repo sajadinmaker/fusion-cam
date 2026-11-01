@@ -5,6 +5,10 @@ ZSL burst capture of RAW frames → align-and-merge fusion → scene-aware (sema
 processing → Apple-style tone mapping and color science. See the research doc at
 `~/iphone-camera-to-android-research.md` for the full analysis this app implements.
 
+Shared photos are stamped with the app watermark **fusioncam(sajadinmaker)**
+(white text, drop shadow, scales with image width — applied to every merged
+JPEG before it is written).
+
 ## Phase 0 (this module) — Device capability scanner
 
 `app` deploys as `dev.fusioncam.scanner`. Tap **Scan this device** and it reports,
