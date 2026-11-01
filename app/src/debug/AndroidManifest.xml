@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-only manifest merge: exports CaptureActivity so the on-device
+     smoke tests can drive it via `adb shell am start` directly. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application>
+        <activity
+            android:name=".ui.CaptureActivity"
+            android:exported="true"
+            tools:replace="android:exported" />
+    </application>
+</manifest>

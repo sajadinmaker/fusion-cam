@@ -30,6 +30,29 @@ A full JSON report lands in
 `Android/data/dev.fusioncam.scanner/files/reports/capabilities-<ts>.json`
 for the tuning database.
 
+## On-device smoke test ✅ (Android 16 emulator, torch-era LEVEL_3 camera)
+
+First end-to-end device run of Phases 0–3, driven over adb:
+- **Phase 0**: scan completed on-device; camera #1 (Back) scored **tier B/73**:
+  HW LEVEL_3, RAW_SENSOR 1856×1392 @30 fps, RGGB, max analog ISO 1600, no OIS.
+- **Session resilience found + fixed**: the emulator kills the combined
+  preview+RAW session synchronously ("Surface was abandoned") when a layout
+  pass replaces the SurfaceView's native surface between `surfaceCreated`
+  and session creation. Previously this path never reached the RAW-only
+  retry, leaving the engine permanently sessionless. Fixes: synchronous
+  session-creation failure now also falls back to RAW-only
+  (`CaptureEngine.configureSession`), and `surfaceChanged` restarts the
+  engine with the fresh surface. Verified: engine recovers into RAW-only
+  streaming automatically.
+- **Phase 2/3 merge on-device**: latch 4 ZSL frames (ISO 100, 4.36 ms) →
+  per-channel black levels [64,64,64,64], white 4000, RGGB → full
+  align+merge+demosaic+WB path → valid 1856×1392 `merged.jpg` in **722 ms**
+  (2.6 MP ×4 frames, single pool). Emulator image is the synthetic test
+  pattern; render is artifact-free (no ghosting/dislocation).
+- App now drives the camera screen directly under debug builds to avoid
+  fighting UI scroll (`app/src/debug/AndroidManifest.xml` exports
+  `CaptureActivity` for debug only).
+
 ## Phase 3.5 — border alignment + noise-scaled merge ✅ (host-tested)
 
 - **Border-tile alignment fixed**: the search previously discarded any

@@ -11,6 +11,7 @@ import android.media.ImageReader
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
 import android.view.SurfaceHolder
+import android.view.Surface
 import android.view.SurfaceView
 import android.view.View
 import dev.fusioncam.scanner.capture.CaptureEngine
@@ -43,6 +44,7 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
     private lateinit var status: android.widget.TextView
     private lateinit var surfaceView: SurfaceView
     private var engineStarted = false
+    private var lastStartedSurface: Surface? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,9 +65,21 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
             holder.addCallback(object : android.view.SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: android.view.SurfaceHolder) {
                     maybeStartEngine(holder)
+                    lastStartedSurface = holder.surface
                 }
                 override fun surfaceChanged(holder: android.view.SurfaceHolder, f: Int, w: Int, h: Int) {
-                    // Engine needs the surface only once; start is idempotent.
+                    // Layout passes may recreate the native Surface after
+                    // surfaceCreated; a session holding the old (abandoned)
+                    // object dies. Restart against the fresh surface — start
+                    // is idempotent for identical surfaces.
+                    if (holder.surface?.isValid != true) return
+                    if (holder.surface != lastStartedSurface) {
+                        engine?.release()
+                        engine = null
+                        engineStarted = false
+                        maybeStartEngine(holder)
+                        lastStartedSurface = holder.surface
+                    }
                 }
                 override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {
                     engine?.release()

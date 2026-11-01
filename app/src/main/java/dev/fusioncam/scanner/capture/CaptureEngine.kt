@@ -128,7 +128,14 @@ class CaptureEngine(
                     retryRawOnly(device)
                 }
             }, cameraHandler)
-        }.onFailure { listener.onStatus("Session create failed: ${it.message}") }
+            }.onFailure {
+                listener.onStatus("Session create failed: ${it.message}")
+                // Synchronous failure (e.g. preview Surface abandoned by a
+                // relayout) — the RAW-only retry was previously reached only
+                // through onConfigureFailed and never in this case, leaving
+                // the engine permanently sessionless.
+                runCatching { retryRawOnly(device) }
+            }
     }
 
     private fun retryRawOnly(device: CameraDevice) {
