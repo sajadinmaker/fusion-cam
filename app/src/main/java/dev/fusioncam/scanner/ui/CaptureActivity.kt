@@ -29,6 +29,14 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
 
     companion object {
         const val EXTRA_CAMERA_ID = "cameraId"
+
+        /**
+         * Debug test hook: forces the YUV fallback path even when RAW_SENSOR
+         * exists, so RAW-less-device plumbing can be exercised on devices that
+         * have RAW. Reachable only via adb on exported debug builds; production
+         * code paths never set it.
+         */
+        const val EXTRA_FORCE_YUV = "forceYuv"
         private const val PERMISSION_REQUEST = 42
 
         private enum class Mode { SAVE_DNG, MERGE_BURST }
@@ -40,6 +48,7 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
     private var mergedPreviewView: android.widget.ImageView? = null
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private var cameraIdOverride: String? = null
+    private var engineForceYuv = false
 
     private lateinit var status: android.widget.TextView
     private lateinit var surfaceView: SurfaceView
@@ -51,6 +60,7 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         cameraIdOverride = intent.getStringExtra(EXTRA_CAMERA_ID)
+        engineForceYuv = intent.getBooleanExtra(EXTRA_FORCE_YUV, false)
 
         val column = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
@@ -136,7 +146,7 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
         val engineSurface: SurfaceHolder = holder ?: surfaceView.holder
         engineStarted = true
         engine = engine ?: CaptureEngine(applicationContext, this)
-        engine?.start(resolveCameraId(), engineSurface)
+        engine?.start(resolveCameraId(), engineSurface, forceYuv = engineForceYuv)
         // captureFormat is decided synchronously inside start(); keep the
         // buttons honest on cameras without RAW_SENSOR.
         val raw = engine?.captureFormat == CaptureEngine.CaptureFormat.RAW_BAYER
@@ -181,7 +191,7 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
                         else mergeBurstOnIo(frames, characteristics, run, best)
                 }
             } catch (t: Throwable) {
-                onStatus("$mode failed: ${t.message}")
+                onStatus("$mode failed: ${t.message}\n${android.util.Log.getStackTraceString(t)}")
             } finally {
                 frames.forEach { runCatching { it.image.close() } }
                 runOnUiThread {

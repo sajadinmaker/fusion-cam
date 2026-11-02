@@ -70,6 +70,10 @@ class MainActivity : Activity() {
         statusLine = android.widget.TextView(this).apply { text = "Idle." }
         column.addView(statusLine)
 
+        column.addView(captureButton, android.widget.LinearLayout.LayoutParams(
+            android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+        ).also { it.topMargin = dp(16) })
+
         container = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
         }

@@ -84,7 +84,7 @@ class CaptureEngine(
     private var framesInWindow = 0
     private var latching = false
 
-    fun start(targetCameraId: String, previewHolder: SurfaceHolder) {
+    fun start(targetCameraId: String, previewHolder: SurfaceHolder, forceYuv: Boolean = false) {
         bestCameraId = targetCameraId
         val characteristics = runCatching { cameraManager.getCameraCharacteristics(targetCameraId) }
             .getOrNull()
@@ -101,15 +101,19 @@ class CaptureEngine(
         // fallback (works on every Camera2 device, LEGACY included).
         val rawSizes = runCatching { map?.getOutputSizes(ImageFormat.RAW_SENSOR) }.getOrNull()
         val rawSize = rawSizes?.maxByOrNull { it.width.toLong() * it.height }
-        captureFormat = if (rawSize != null) CaptureFormat.RAW_BAYER else CaptureFormat.YUV
+        captureFormat = if (rawSize != null && !forceYuv) CaptureFormat.RAW_BAYER else CaptureFormat.YUV
 
         val previewSize = choosePreviewSize(map, previewHolder.surfaceFrame)
         previewHolder.setFixedSize(previewSize.width, previewSize.height)
         previewSurface = previewHolder.surface
 
-        frameReader = if (rawSize != null) {
+        // The reader format must follow captureFormat: with forceYuv (or any
+        // YUV-fallback path) the camera produces YUV_420_888 images whose
+        // planes[1] we index during merge — sticking to RAW_SENSOR here would
+        // deliver 1-plane Bayer images and crash the YUV merge.
+        frameReader = if (captureFormat == CaptureFormat.RAW_BAYER) {
             ImageReader.newInstance(
-                rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, queueDepthFor(rawSize)
+                rawSize!!.width, rawSize.height, ImageFormat.RAW_SENSOR, queueDepthFor(rawSize)
             )
         } else {
             val yuvSize = chooseYuvMergeSize(map)
@@ -123,7 +127,11 @@ class CaptureEngine(
         }
         frameReader!!.setOnImageAvailableListener({ reader ->
             if (latching) return@setOnImageAvailableListener // keep frames queued for the latch
-            reader.acquireLatestImage()?.apply {
+            // maxImages can be transiently exhausted around a latch (drain
+            // holds buffers while launching resumes) — acquireLatestImage
+            // then throws, which on this handler thread is fatal. Skipping
+            // the frame is the correct behavior: it's only an fps count.
+            runCatching { reader.acquireLatestImage() }.getOrNull()?.apply {
                 observeFps()
                 close() // during streaming we only count frames, we don't keep them
             }

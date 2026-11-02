@@ -1,6 +1,16 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+}
+
+// Release signing is opt-in and guarded: present only when a keystore.properties
+// (gitignored) exists with storeFile/storePassword/keyAlias/keyPassword. CI and
+// cloner machines without it still produce unsigned release builds.
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
 }
 
 android {
@@ -11,11 +21,13 @@ android {
         applicationId = "dev.fusioncam.scanner"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.6.0-yuv-fallback"
+        versionCode = 3
+        versionName = "0.6.0"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "x86_64")
+            // arm64-v8a: modern phones; armeabi-v7a: 32-bit Android 8/9 era
+            // devices; x86_64: emulators.
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
         }
         externalNativeBuild {
             cmake {
@@ -36,6 +48,14 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (keystoreProps.isNotEmpty()) {
+                signingConfig = signingConfigs.create("release") {
+                    storeFile = file(keystoreProps.getProperty("storeFile"))
+                    storePassword = keystoreProps.getProperty("storePassword")
+                    keyAlias = keystoreProps.getProperty("keyAlias")
+                    keyPassword = keystoreProps.getProperty("keyPassword")
+                }
+            }
         }
     }
 

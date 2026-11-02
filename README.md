@@ -9,6 +9,20 @@ Shared photos are stamped with the app watermark **fusioncam(sajadinmaker)**
 (white text, drop shadow, scales with image width — applied to every merged
 JPEG before it is written).
 
+## Device support & install
+
+- **Android 8 and above** (minSdk 24, so Android 7.x rides along too)
+- Native core ships for `arm64-v8a`, `armeabi-v7a` and `x86_64` — 32-bit
+  Android 8/9 era phones included
+- Every Camera2 device produces photos: RAW Bayer burst where the HAL offers
+  `RAW_SENSOR`, otherwise the YUV_420_888 fallback merge (Phase 3.6)
+
+**Install (release):** grab `app-release.apk` from the
+[Releases page](https://github.com/sajadinmaker/fusion-cam/releases) and
+sideload it (Settings → "install unknown apps" → open the APK). The repo
+builds unsigned release APKs when no `keystore.properties` is present;
+release artifacts attached here are signed with the project key.
+
 ## Phase 0 (this module) — Device capability scanner
 
 `app` deploys as `dev.fusioncam.scanner`. Tap **Scan this device** and it reports,
@@ -86,6 +100,23 @@ Host test extended: a native 8-bit luma fixture (per-tile dot SNR matched to
 the 16-bit RAW fixture) proves the YUV burst locks alignment truth on 24/24
 tiles, cuts flat-region variance 2.4 → 1.0, and converts flat chroma to a
 near-gray pixel — all under AddressSanitizer+UBSan.
+
+### v0.6.0 release verification (on-device)
+
+- YUV fallback driven live via a documented debug hook
+  (`adb shell am start ... CaptureActivity --ez forceYuv true`): 4 YUV frames
+  latched → merged in 222 ms, plus the single-frame YUV photo path. A real bug
+  was caught exactly here: the forced-YUV path built the ImageReader as
+  RAW_SENSOR (1 plane) and crashed on `planes[1]` — the reader format now
+  follows `captureFormat`.
+- Streaming robustness: `acquireLatestImage` can hit the `maxImages` cap
+  around a latch and throw fatally on the capture thread — now guarded (skip
+  the frame, keep counting).
+- Release build signed + smoke-tested end to end: MainActivity scan →
+  capture engine → 4-frame RAW merge in 209 ms → watermarked JPEG, no crashes.
+- Fixed: the Phase 1 capture button on MainActivity was constructed but never
+  added to the layout (dead code) — the production entry point could never
+  open the camera.
 
 ## Phase 3.5 — border alignment + noise-scaled merge ✅ (host-tested)
 
@@ -184,6 +215,13 @@ processing; RAW-only preview fallback is untested on LEGACY devices.
 ```
 
 Install on a phone: `adb install app/build/outputs/apk/debug/app-debug.apk`.
+
+**Signed release:** place a gitignored `keystore.properties` at the repo root
+with `storeFile` / `storePassword` / `keyAlias` / `keyPassword` (PKCS12: make
+the key password equal the store password), then run `./gradlew
+assembleRelease` → `app/build/outputs/apk/release/app-release.apk`. Without
+the properties file the release build still succeeds, unsigned.
+
 No AndroidX/Compose dependencies on purpose — keep the scanner lean until
 Phase 1 introduces CameraX.
 
