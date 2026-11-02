@@ -43,6 +43,8 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
 
     private lateinit var status: android.widget.TextView
     private lateinit var surfaceView: SurfaceView
+    private lateinit var shutterButton: android.widget.Button
+    private lateinit var mergeButton: android.widget.Button
     private var engineStarted = false
     private var lastStartedSurface: Surface? = null
 
@@ -94,16 +96,16 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
         }
         column.addView(surfaceView)
 
-        val shutter = android.widget.Button(this).apply {
+        shutterButton = android.widget.Button(this).apply {
             text = "Phase 1: save sharpest RAW frame"
         }
-        column.addView(shutter, rowParams(top = dp(12)))
-        shutter.setOnClickListener {
+        column.addView(shutterButton, rowParams(top = dp(12)))
+        shutterButton.setOnClickListener {
             pendingMode = Mode.SAVE_DNG
             engine?.latch()
         }
 
-        val mergeButton = android.widget.Button(this).apply {
+        mergeButton = android.widget.Button(this).apply {
             text = "Phase 2: HDR+ merge burst"
         }
         column.addView(mergeButton, rowParams(top = dp(8)))
@@ -135,6 +137,13 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
         engineStarted = true
         engine = engine ?: CaptureEngine(applicationContext, this)
         engine?.start(resolveCameraId(), engineSurface)
+        // captureFormat is decided synchronously inside start(); keep the
+        // buttons honest on cameras without RAW_SENSOR.
+        val raw = engine?.captureFormat == CaptureEngine.CaptureFormat.RAW_BAYER
+        shutterButton.text =
+            if (raw) "Phase 1: save sharpest RAW frame" else "Save photo (YUV — no RAW_SENSOR)"
+        mergeButton.text =
+            if (raw) "Phase 2: HDR+ merge burst" else "Phase 2: HDR+ merge burst (YUV)"
     }
 
     private fun resolveCameraId(): String {
@@ -162,9 +171,14 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
         ioExecutor.execute {
             try {
                 run.mkdirs()
+                val yuvMode = engine?.captureFormat == CaptureEngine.CaptureFormat.YUV
                 when (mode) {
-                    Mode.SAVE_DNG -> saveDng(frames, characteristics, run, best)
-                    Mode.MERGE_BURST -> mergeBurstOnIo(frames, characteristics, run, best)
+                    Mode.SAVE_DNG ->
+                        if (yuvMode) saveYuvFrame(frames, run)
+                        else saveDng(frames, characteristics, run, best)
+                    Mode.MERGE_BURST ->
+                        if (yuvMode) mergeYuvOnIo(frames, run, best)
+                        else mergeBurstOnIo(frames, characteristics, run, best)
                 }
             } catch (t: Throwable) {
                 onStatus("$mode failed: ${t.message}")
@@ -241,16 +255,84 @@ class CaptureActivity : Activity(), CaptureEngine.Listener {
 
         val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
         bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
-        stampWatermark(bitmap)
-        FileOutputStream(File(run, "merged.jpg")).use { out ->
-            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, out)
-        }
-
-        val displayW = dp(280)
-        val displayH = maxOf(displayW * h / w, 1)
-        val thumb = android.graphics.Bitmap.createScaledBitmap(bitmap, displayW, displayH, true)
-        runOnUiThread { mergedPreviewView?.setImageBitmap(thumb) }
+        val saved = finishAndSave(bitmap, run, "merged.jpg")
+        runOnUiThread { mergedPreviewView?.setImageBitmap(thumbOf(saved)) }
         onStatus("Merged in ${ms}ms · saved → ${File(run, "merged.jpg").absolutePath}")
+    }
+
+    /**
+     * YUV fallback merge for cameras without RAW_SENSOR (LEGACY/LIMITED
+     * HALs): the native luma align+merge handles the fusion; here we compact
+     * the planes, pick the sharpest frame as reference and save.
+     */
+    private fun mergeYuvOnIo(
+        frames: List<CaptureEngine.LatchedFrame>,
+        run: File,
+        best: CaptureEngine.LatchedFrame,
+    ) {
+        writeFramesJson(frames, run)
+        val first = frames.firstOrNull() ?: return
+        val w = first.image.width
+        val h = first.image.height
+        val planeBytes = frames.map { dev.fusioncam.scanner.fusion.FusionNative.yuvBytes(it.image) }
+        val refIndex = frames.indexOf(best).let { if (it < 0) 0 else it }
+
+        val iso = best.result?.get(CaptureResult.SENSOR_SENSITIVITY) ?: 100
+        val tauScale = maxOf(1f, iso / 100f)
+
+        onStatus("Merging ${planeBytes.size} YUV frames (${w}x$h, iso=$iso)…")
+        val t0 = System.currentTimeMillis()
+        val pixels = dev.fusioncam.scanner.fusion.FusionNative
+            .mergeBurstYuv(planeBytes.toTypedArray(), refIndex, w, h, tauScale)
+        val ms = System.currentTimeMillis() - t0
+
+        val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+        val saved = finishAndSave(bitmap, run, "merged.jpg")
+        runOnUiThread { mergedPreviewView?.setImageBitmap(thumbOf(saved)) }
+        onStatus("Merged in ${ms}ms · saved → ${File(run, "merged.jpg").absolutePath}")
+    }
+
+    /** Single-frame photo on cameras without RAW_SENSOR (YUV → JPEG). */
+    private fun saveYuvFrame(frames: List<CaptureEngine.LatchedFrame>, run: File) {
+        writeFramesJson(frames, run)
+        val best = frames.first()
+        val w = best.image.width
+        val h = best.image.height
+        val pixels = dev.fusioncam.scanner.fusion.FusionNative.mergeBurstYuv(
+            arrayOf(dev.fusioncam.scanner.fusion.FusionNative.yuvBytes(best.image)),
+            0, w, h, 1f,
+        )
+        val bitmap = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        bitmap.setPixels(pixels, 0, w, 0, 0, w, h)
+        finishAndSave(bitmap, run, "photo.jpg")
+        onStatus("Saved → ${File(run, "photo.jpg").absolutePath}")
+    }
+
+    /** Rotate upright for the sensor orientation, stamp the watermark, write the JPEG. */
+    private fun finishAndSave(
+        bitmap: android.graphics.Bitmap,
+        run: File,
+        name: String,
+    ): android.graphics.Bitmap {
+        val upright = rotateBitmap(bitmap, engine?.sensorOrientation ?: 0)
+        stampWatermark(upright)
+        FileOutputStream(File(run, name)).use { out ->
+            upright.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, out)
+        }
+        return upright
+    }
+
+    private fun thumbOf(bitmap: android.graphics.Bitmap): android.graphics.Bitmap {
+        val displayW = dp(280)
+        val displayH = maxOf(displayW * bitmap.height / bitmap.width, 1)
+        return android.graphics.Bitmap.createScaledBitmap(bitmap, displayW, displayH, true)
+    }
+
+    private fun rotateBitmap(bitmap: android.graphics.Bitmap, degrees: Int): android.graphics.Bitmap {
+        if (degrees % 360 == 0) return bitmap
+        val m = android.graphics.Matrix().apply { postRotate(degrees.toFloat()) }
+        return android.graphics.Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, m, true)
     }
 
     /**

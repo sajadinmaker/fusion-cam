@@ -9,6 +9,11 @@
 //      hard ghost-discard
 //   4. "finish": parity-aware bilinear demosaic + gamma -> sRGB pixels
 //
+// Also implements the universal-device fallback (mergeBurstYuv): the same
+// align+merge machinery on the luma plane of YUV_420_888 frames for cameras
+// without RAW_SENSOR (LEGACY/LIMITED HALs, i.e. most Android 8+ phones);
+// chroma comes from the reference frame, BT.601 limited-range to sRGB.
+//
 // Phase 2 simplifications (revisit in Phase 3):
 //   * constant noise-floor estimate (paper: per-frame noise model)
 //   * even-only full-resolution offsets (keeps Bayer parity; costs 1px
@@ -26,12 +31,18 @@
 namespace {
 
 using u16 = uint16_t;
+using u8 = uint8_t;
 
 constexpr int kTile = 16;           // tile size, level-pixel units
 constexpr int kSearch = 4;          // search radius per pyramid level
 constexpr int kLevels = 4;          // level0 = half-res gray
 constexpr float kTau = 256.0f;      // noise floor for the Wiener weight
-constexpr float kGhostDiscard = 8192.0f;
+// Tile ghost discard sits a fixed multiple above the noise floor so a
+// high-ISO merge (scaled tau) never trips it on noise alone.
+constexpr float kGhostTauMultiple = 32.0f;
+constexpr float kGhostDiscard = kGhostTauMultiple * kTau;
+constexpr float kTauYuv = 16.0f;    // 8-bit luma noise floor (variance units)
+constexpr int kClipYuv = 250;       // near-white Y sentinel threshold
 constexpr u16 kInvalid = 0xFFFF;    // clipped sentinel in gray pyramids
 constexpr int16_t kNoMatch = INT16_MAX;
 constexpr int kBayerChannels = 4;   // R, G-even, G-odd, B
@@ -219,10 +230,13 @@ AlignOffsets align(const GrayPyramid& ref, const GrayPyramid& alt) {
 // Border tiles may carry offsets that push the alt read out of the frame;
 // alt pixels outside [0,H)x[0,W) are skipped (never clamped), consistent
 // with the overlap-only alignment. `tau` is the per-pixel Wiener noise
-// floor in variance units — callers scale it for ISO/noise conditions.
+// floor in variance units — callers scale it for ISO/noise conditions, and
+// `ghostDiscard` should ride along (kGhostTauMultiple × tau) so high-ISO
+// noise never discards tiles on its own.
 void merge(const u16* ref, const std::vector<u16*>& alts,
            const std::vector<AlignOffsets>& offsets, int W, int H,
-           int clipThresh, float tau, u16* merged, int tyBegin, int tyEnd) {
+           int clipThresh, float tau, float ghostDiscard,
+           u16* merged, int tyBegin, int tyEnd) {
     const int tw = offsets.empty() ? 0 : offsets[0].tw;
     const int th = offsets.empty() ? 0 : offsets[0].th;
     for (int ty = tyBegin; ty < tyEnd && ty < th; ty++) {
@@ -256,7 +270,7 @@ void merge(const u16* ref, const std::vector<u16*>& alts,
                     }
                 }
                 if (valid == 0) { discard[a] = true; continue; }
-                discard[a] = static_cast<float>(diff / valid) > kGhostDiscard;
+                discard[a] = static_cast<float>(diff / valid) > ghostDiscard;
             }
             // Weighted pixel merge inside the tile, per-pixel weights.
             for (int cy = 0; cy < kTile * 2; cy++) {
@@ -292,7 +306,7 @@ void merge(const u16* ref, const std::vector<u16*>& alts,
 // bands of `merged`, so no synchronization is needed beyond the joins.
 void mergeThreaded(const u16* ref, const std::vector<u16*>& alts,
                    const std::vector<AlignOffsets>& offsets, int W, int H,
-                   int clipThresh, float tau, u16* merged) {
+                   int clipThresh, float tau, float ghostDiscard, u16* merged) {
     const int th = offsets.empty() ? 0 : offsets[0].th;
     if (th <= 0) return;
     const unsigned hw = std::thread::hardware_concurrency();
@@ -302,7 +316,8 @@ void mergeThreaded(const u16* ref, const std::vector<u16*>& alts,
     for (int t = 0; t < workers; t++) {
         pool.emplace_back([&, t]() {
             for (int ty = t; ty < th; ty += workers) {
-                merge(ref, alts, offsets, W, H, clipThresh, tau, merged, ty, ty + 1);
+                merge(ref, alts, offsets, W, H, clipThresh, tau, ghostDiscard,
+                      merged, ty, ty + 1);
             }
         });
     }
@@ -411,6 +426,32 @@ void finish(const u16* merged, int W, int H, int cfa, int clipRange,
             }
             outPixels[static_cast<size_t>(y) * W + x] =
                 (0xFF << 24) | (bb << 16) | (gg << 8) | rr;
+        }
+    }
+}
+
+// BT.601 limited-range YUV -> sRGB (the range camera YUV pipelines emit).
+// Luma is the merged plane; chroma is the reference frame's — fusing
+// misaligned chroma ghosts, so the fallback keeps chroma unfused.
+void yuvToRgb(const u16* y, const u8* u, const u8* v, int W, int H, jint* outPixels) {
+    const int cw = W / 2, chh = H / 2;
+    for (int py = 0; py < H; py++) {
+        const int cy = std::min(py / 2, chh - 1);
+        const size_t ubase = static_cast<size_t>(cy) * cw;
+        for (int px = 0; px < W; px++) {
+            const int cx = std::min(px / 2, cw - 1);
+            int yv = static_cast<int>(y[static_cast<size_t>(py) * W + px]) - 16;
+            if (yv < 0) yv = 0;
+            const int uc = static_cast<int>(u[ubase + cx]) - 128;
+            const int vc = static_cast<int>(v[ubase + cx]) - 128;
+            int r = (1192 * yv + 1634 * vc) >> 10;
+            int g = (1192 * yv - 400 * uc - 833 * vc) >> 10;
+            int b = (1192 * yv + 2066 * uc) >> 10;
+            r = std::min(std::max(r, 0), 255);
+            g = std::min(std::max(g, 0), 255);
+            b = std::min(std::max(b, 0), 255);
+            outPixels[static_cast<size_t>(py) * W + px] =
+                (0xFF << 24) | (b << 16) | (g << 8) | r;
         }
     }
 }
@@ -534,12 +575,100 @@ Java_dev_fusioncam_scanner_fusion_FusionNative_mergeBurst(
     // Merge (merged pre-filled from ref; fusion overwrites tile by tile),
     // striped over tile rows per worker.
     std::vector<u16> merged(raws[refIndex]); // copy of ref
-    mergeThreaded(refPtr, altPtrs, offsets, W, H, clipThresh, tau, merged.data());
+    mergeThreaded(refPtr, altPtrs, offsets, W, H, clipThresh, tau, kGhostDiscard, merged.data());
 
     // Finish to sRGB pixels.
     jintArray out = env->NewIntArray(static_cast<jsize>(pixels));
     std::vector<jint> pixelsBuf(pixels);
     finish(merged.data(), W, H, cfa, clipRange, wb, pixelsBuf.data());
+    env->SetIntArrayRegion(out, 0, static_cast<jsize>(pixels), pixelsBuf.data());
+    return out;
+}
+
+// ------------------------------------------------------------- YUV fallback
+//
+// Universal-device path: cameras without RAW_SENSOR (LEGACY/LIMITED HALs) can
+// still shoot merged bursts. frames[i] is one packed [Y, U, V] buffer from
+// FusionNative.yuvBytes (stride compaction done on the Java side). Luma runs
+// the same pyramid align + Wiener merge as RAW — the Y plane is just a
+// single-channel image, so buildGray/align/merge work unchanged. Chroma is
+// taken from the reference frame. A single frame (n == 1) skips fusion and
+// only converts: the plain-photo path on RAW-less devices.
+extern "C" JNIEXPORT jintArray JNICALL
+Java_dev_fusioncam_scanner_fusion_FusionNative_mergeBurstYuv(
+        JNIEnv* env, jclass /*klass*/, jobjectArray frames, jint refIndex,
+        jint width, jint height, jfloat tauScale) {
+
+    const int W = width, H = height;
+    const size_t pixels = static_cast<size_t>(W) * H;
+    const int cw = W / 2, chh = H / 2;
+    const jint n = env->GetArrayLength(frames);
+    if (n < 1 || refIndex < 0 || refIndex >= n) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"),
+                      "need >=1 frame and a valid refIndex");
+        return nullptr;
+    }
+    const size_t yBytes = pixels;
+    const size_t cBytes = static_cast<size_t>(cw) * chh;
+    const size_t bytesPerFrame = yBytes + 2 * cBytes;
+
+    std::vector<std::vector<u16>> luma(static_cast<size_t>(n));
+    std::vector<u8> refU, refV;
+    for (jint i = 0; i < n; i++) {
+        jbyteArray jbytes = static_cast<jbyteArray>(env->GetObjectArrayElement(frames, i));
+        if (env->GetArrayLength(jbytes) < static_cast<jsize>(bytesPerFrame)) {
+            env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"),
+                          "frame buffer too small");
+            return nullptr;
+        }
+        jbyte* src = env->GetByteArrayElements(jbytes, nullptr);
+        luma[i].resize(pixels);
+        for (size_t p = 0; p < pixels; p++) luma[i][p] = static_cast<u8>(src[p]);
+        if (i == refIndex) {
+            refU.assign(src + yBytes, src + yBytes + cBytes);
+            refV.assign(src + yBytes + cBytes, src + yBytes + 2 * cBytes);
+        }
+        env->ReleaseByteArrayElements(jbytes, src, JNI_ABORT);
+        env->DeleteLocalRef(jbytes);
+    }
+
+    std::vector<u16> merged(luma[refIndex]); // pre-filled from ref
+    const jint nAlt = n - 1;
+    if (nAlt > 0) {
+        const u16* refPtr = luma[refIndex].data();
+        GrayPyramid refGray = buildGray(refPtr, W, H, kClipYuv);
+        std::vector<std::vector<u16>> altRaws(static_cast<size_t>(nAlt));
+        std::vector<AlignOffsets> offsets(static_cast<size_t>(nAlt));
+        std::vector<u16*> altPtrs(static_cast<size_t>(nAlt));
+        for (jint i = 0, k = 0; i < n; i++) {
+            if (i == refIndex) continue;
+            altRaws[k] = std::move(luma[i]);
+            altPtrs[k] = altRaws[k].data();
+            k++;
+        }
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int workers = static_cast<int>(std::min<size_t>(
+            std::max(hw, 1u), static_cast<size_t>(nAlt)));
+        std::vector<std::thread> pool;
+        for (int t = 0; t < workers; t++) {
+            pool.emplace_back([&, t, nAlt]() {
+                for (int a = t; a < nAlt; a += workers) {
+                    GrayPyramid altGray = buildGray(altPtrs[a], W, H, kClipYuv);
+                    offsets[a] = align(refGray, altGray);
+                }
+            });
+        }
+        for (auto& thr : pool) thr.join();
+
+        // τ rides with ISO exactly like the RAW path; ghost discard rides with τ.
+        const float tau = kTauYuv * std::max(tauScale, 1.0f);
+        mergeThreaded(refPtr, altPtrs, offsets, W, H, kClipYuv, tau,
+                      kGhostTauMultiple * tau, merged.data());
+    }
+
+    jintArray out = env->NewIntArray(static_cast<jsize>(pixels));
+    std::vector<jint> pixelsBuf(pixels);
+    yuvToRgb(merged.data(), refU.data(), refV.data(), W, H, pixelsBuf.data());
     env->SetIntArrayRegion(out, 0, static_cast<jsize>(pixels), pixelsBuf.data());
     return out;
 }

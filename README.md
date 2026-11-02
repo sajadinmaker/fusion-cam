@@ -27,8 +27,8 @@ Each camera gets a score (0–100) and a tier:
 |------|---------|
 | A (≥85) | Full HDR+-style pipeline target |
 | B (≥70) | Pipeline supported, needs per-device tuning |
-| C (≥50) | Degraded pipeline (fewer frames / sYCC-only merge) |
-| D (<50) | Not supported (no RAW / LEGACY HAL) |
+| C (≥50) | Degraded pipeline (fewer frames / YUV merge) |
+| D (<50) | No RAW — YUV fallback merge only (since Phase 3.6) |
 
 A full JSON report lands in
 `Android/data/dev.fusioncam.scanner/files/reports/capabilities-<ts>.json`
@@ -56,6 +56,36 @@ First end-to-end device run of Phases 0–3, driven over adb:
 - App now drives the camera screen directly under debug builds to avoid
   fighting UI scroll (`app/src/debug/AndroidManifest.xml` exports
   `CaptureActivity` for debug only).
+
+## Phase 3.6 — universal device support: YUV fallback ✅ (host-tested)
+
+Every Android 8+ phone now produces photos, RAW or not (minSdk 24 covers all
+of them; Android 7.0 rides along for free):
+
+- `CaptureEngine` picks the capture path per camera: RAW Bayer burst (as
+  before) when `RAW_SENSOR` exists, otherwise a **YUV_420_888 fallback** —
+  YUV works on every Camera2 device, LEGACY and LIMITED HALs included. The
+  old "No RAW_SENSOR output" dead end is gone.
+- Fallback merge (`FusionNative.mergeBurstYuv`): the same 4-level pyramid
+  align + per-pixel Wiener merge run on the Y plane (τ = 16·ISO/100 in 8-bit
+  variance units; ghost discard rides with τ at 32× so high-ISO noise never
+  trips it). Chroma comes from the reference frame — fusing misaligned
+  chroma ghosts (documented simplification). A single frame (n = 1) converts
+  without fusion: the plain-photo path on RAW-less devices.
+- YUV planes are compacted on the Java side (arbitrary row/pixel strides
+  handled), converted BT.601 limited-range → sRGB in native code.
+- All output paths now rotate by `SENSOR_ORIENTATION` before watermark+save,
+  so JPEGs come out upright on phones (previously only the emulator's
+  0°-orientation path existed).
+- Sharpness ranking has a Y-plane Laplacian variant for the fallback (same
+  ±2 sampling scale as the Bayer-green proxy).
+- YUV merge size is capped at ~8 MP so low-end SoCs stay interactive; queue
+  depth still adapts to frame size.
+
+Host test extended: a native 8-bit luma fixture (per-tile dot SNR matched to
+the 16-bit RAW fixture) proves the YUV burst locks alignment truth on 24/24
+tiles, cuts flat-region variance 2.4 → 1.0, and converts flat chroma to a
+near-gray pixel — all under AddressSanitizer+UBSan.
 
 ## Phase 3.5 — border alignment + noise-scaled merge ✅ (host-tested)
 

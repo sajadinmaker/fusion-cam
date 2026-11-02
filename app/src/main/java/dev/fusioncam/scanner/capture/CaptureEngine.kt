@@ -23,11 +23,17 @@ import dev.fusioncam.scanner.core.FrameMeta
 /**
  * Phase 1 capture engine.
  *
- * Runs a repeating (preview + RAW) stream — the reader itself is the rolling
- * ZSL buffer. Pressing the latch stops the repeating request, drains up to
- * `maxImages` buffered RAW frames, ranks them by a Bayer-green Laplacian
- * sharpness proxy (Apple's "pick the sharpest frame already taken"), and
- * hands them back with their paired per-frame metadata.
+ * Runs a repeating (preview + capture) stream — the reader itself is the
+ * rolling ZSL buffer. Pressing the latch stops the repeating request, drains
+ * up to `maxImages` buffered frames, ranks them by a Laplacian sharpness
+ * proxy (Apple's "pick the sharpest frame already taken"), and hands them
+ * back with their paired per-frame metadata.
+ *
+ * Every camera can capture: when the HAL offers RAW_SENSOR the engine streams
+ * RAW Bayer ([CaptureFormat.RAW_BAYER]); otherwise it falls back to a
+ * YUV_420_888 reader with identical latch semantics ([CaptureFormat.YUV]) so
+ * LEGACY/LIMITED devices — i.e. most Android 8+ phones — reach the YUV
+ * fusion path instead of dead-ending.
  */
 class CaptureEngine(
     context: Context,
@@ -45,6 +51,13 @@ class CaptureEngine(
         val sharpness: Double,
     )
 
+    /** Capture path chosen per camera: RAW Bayer for fusion, YUV fallback otherwise. */
+    enum class CaptureFormat { RAW_BAYER, YUV }
+
+    var captureFormat: CaptureFormat = CaptureFormat.RAW_BAYER
+        private set
+    var sensorOrientation: Int = 0
+        private set
     var bestCameraId: String = ""
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -56,7 +69,7 @@ class CaptureEngine(
     private var characteristics: CameraCharacteristics? = null
     private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
-    private var rawReader: ImageReader? = null
+    private var frameReader: ImageReader? = null
     private var previewSurface: Surface? = null
     private var requestBuilder: CaptureRequest.Builder? = null
 
@@ -82,22 +95,33 @@ class CaptureEngine(
         this.characteristics = characteristics
 
         val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val rawSize = map?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull {
-            it.width.toLong() * it.height
-        }
-        if (rawSize == null) {
-            listener.onStatus("No RAW_SENSOR output on camera $targetCameraId")
-            return
-        }
+        sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+
+        // RAW Bayer burst when the HAL offers RAW_SENSOR; otherwise the YUV
+        // fallback (works on every Camera2 device, LEGACY included).
+        val rawSizes = runCatching { map?.getOutputSizes(ImageFormat.RAW_SENSOR) }.getOrNull()
+        val rawSize = rawSizes?.maxByOrNull { it.width.toLong() * it.height }
+        captureFormat = if (rawSize != null) CaptureFormat.RAW_BAYER else CaptureFormat.YUV
 
         val previewSize = choosePreviewSize(map, previewHolder.surfaceFrame)
         previewHolder.setFixedSize(previewSize.width, previewSize.height)
         previewSurface = previewHolder.surface
 
-        rawReader = ImageReader.newInstance(
-            rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, queueDepthFor(rawSize)
-        )
-        rawReader!!.setOnImageAvailableListener({ reader ->
+        frameReader = if (rawSize != null) {
+            ImageReader.newInstance(
+                rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, queueDepthFor(rawSize)
+            )
+        } else {
+            val yuvSize = chooseYuvMergeSize(map)
+            if (yuvSize == null) {
+                listener.onStatus("No RAW_SENSOR or YUV_420_888 output on camera $targetCameraId")
+                return
+            }
+            ImageReader.newInstance(
+                yuvSize.width, yuvSize.height, ImageFormat.YUV_420_888, queueDepthFor(yuvSize)
+            )
+        }
+        frameReader!!.setOnImageAvailableListener({ reader ->
             if (latching) return@setOnImageAvailableListener // keep frames queued for the latch
             reader.acquireLatestImage()?.apply {
                 observeFps()
@@ -115,7 +139,7 @@ class CaptureEngine(
 
     private fun configureSession(device: CameraDevice) {
         camera = device
-        val targets = listOfNotNull(previewSurface, rawReader?.surface)
+        val targets = listOfNotNull(previewSurface, frameReader?.surface)
         runCatching {
             device.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(configured: CameraCaptureSession) {
@@ -124,22 +148,22 @@ class CaptureEngine(
                 }
 
                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                    listener.onStatus("Session config failed (preview+RAW); retrying RAW-only")
-                    retryRawOnly(device)
+                    listener.onStatus("Session config failed (preview+capture); retrying capture-only")
+                    retryReaderOnly(device)
                 }
             }, cameraHandler)
             }.onFailure {
                 listener.onStatus("Session create failed: ${it.message}")
                 // Synchronous failure (e.g. preview Surface abandoned by a
-                // relayout) — the RAW-only retry was previously reached only
+                // relayout) — the capture-only retry was previously reached only
                 // through onConfigureFailed and never in this case, leaving
                 // the engine permanently sessionless.
-                runCatching { retryRawOnly(device) }
+                runCatching { retryReaderOnly(device) }
             }
     }
 
-    private fun retryRawOnly(device: CameraDevice) {
-        val rawSurface = rawReader?.surface ?: return
+    private fun retryReaderOnly(device: CameraDevice) {
+        val rawSurface = frameReader?.surface ?: return
         runCatching {
             device.createCaptureSession(listOf(rawSurface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(configured: CameraCaptureSession) {
@@ -160,7 +184,7 @@ class CaptureEngine(
         val ses = session ?: return
         val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
         previewSurface?.let { builder.addTarget(it) }
-        rawReader?.surface?.let { builder.addTarget(it) }
+        frameReader?.surface?.let { builder.addTarget(it) }
         builder.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
         requestBuilder = builder
         runCatching {
@@ -176,8 +200,9 @@ class CaptureEngine(
                 }
             }, cameraHandler)
         }.onFailure { listener.onStatus("Repeating request failed: ${it.message}") }
+        val modeName = if (captureFormat == CaptureFormat.RAW_BAYER) "RAW Bayer" else "YUV fallback"
         listener.onStatus(
-            "Streaming · RAW queue depth $ZSL_DEPTH · ${"%.1f".format(rawFrameFps)} fps (measured)"
+            "Streaming · $modeName · queue depth ${frameReader?.maxImages ?: ZSL_DEPTH} · ${"%.1f".format(rawFrameFps)} fps (measured)"
         )
     }
 
@@ -191,7 +216,7 @@ class CaptureEngine(
     }
 
     private fun drainQueue() {
-        val reader = rawReader
+        val reader = frameReader
         if (reader == null) {
             listener.onStatus("Drain: reader gone")
             return
@@ -221,9 +246,9 @@ class CaptureEngine(
         listener.onFramesLatched(frames, characteristics!!)
     }
 
-    /** Called by the UI once DNG/metadata saving finished. */
+    /** Called by the UI once saving finished. */
     fun afterLatch() {
-        rawReader?.let { reader ->
+        frameReader?.let { reader ->
             while (runCatching { reader.acquireNextImage() }.getOrNull() != null) {
                 // images already consumed by UI; safe to sweep leftovers
             }
@@ -235,13 +260,28 @@ class CaptureEngine(
     fun release() {
         runCatching { session?.close() }
         runCatching { camera?.close() }
-        runCatching { rawReader?.close() }
+        runCatching { frameReader?.close() }
     }
 
-    private fun choosePreviewSize(map: StreamConfigurationMap, holderSize: android.graphics.Rect): Size {
-        val candidates = map.getOutputSizes(SurfaceHolder::class.java)
+    private fun choosePreviewSize(map: StreamConfigurationMap?, holderSize: android.graphics.Rect): Size {
+        val candidates = runCatching { map?.getOutputSizes(SurfaceHolder::class.java) }
+            .getOrNull().orEmpty()
             .filter { it.width <= holderSize.width() && it.height <= holderSize.height() }
         return candidates.maxByOrNull { it.width.toLong() * it.height } ?: Size(640, 480)
+    }
+
+    /**
+     * Largest YUV size that keeps the fallback merge cheap enough on low-end
+     * SoCs (≤ ~8 MP); falls back to the smallest size on offer when every
+     * stream exceeds the cap.
+     */
+    private fun chooseYuvMergeSize(map: StreamConfigurationMap?): Size? {
+        val sizes = runCatching { map?.getOutputSizes(ImageFormat.YUV_420_888) }
+            .getOrNull().orEmpty()
+        if (sizes.isEmpty()) return null
+        return sizes.filter { it.width.toLong() * it.height <= MAX_YUV_MERGE_PIXELS }
+            .maxByOrNull { it.width.toLong() * it.height }
+            ?: sizes.minByOrNull { it.width.toLong() * it.height }
     }
 
     private fun observeFps() {
@@ -255,12 +295,17 @@ class CaptureEngine(
         }
     }
 
+    private fun rankSharpness(image: Image): Double = when (captureFormat) {
+        CaptureFormat.RAW_BAYER -> rankSharpnessBayer(image)
+        CaptureFormat.YUV -> rankSharpnessY(image)
+    }
+
     /**
      * Bayer-green Laplacian proxy: squared 4-neighbour differences of green
      * pixels at stride. Same-channel sampling is safe because stepping ±2
      * preserves Bayer parity, so each neighbor is green too.
      */
-    private fun rankSharpness(image: Image): Double {
+    private fun rankSharpnessBayer(image: Image): Double {
         val cfa = characteristics
             ?.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT) ?: 3
         val plane = image.planes.firstOrNull() ?: return 0.0
@@ -307,12 +352,51 @@ class CaptureEngine(
         return if (count == 0) 0.0 else sum / count
     }
 
+    /**
+     * Y-plane Laplacian proxy for the fallback path: every pixel is luma, so
+     * no Bayer parity bookkeeping is needed. Same ±2 sampling as the Bayer
+     * variant keeps the noise-correlation scale comparable.
+     */
+    private fun rankSharpnessY(image: Image): Double {
+        val plane = image.planes.firstOrNull() ?: return 0.0
+        val rowStride = plane.rowStride
+        val pxStride = plane.pixelStride
+        val w = image.width
+        val h = image.height
+        val buffer = plane.buffer.duplicate()
+
+        var sum = 0.0
+        var count = 0
+        var y = 2
+        while (y < h - 2) {
+            var x = 2
+            while (x < w - 2) {
+                val base = y * rowStride + x * pxStride
+                val center = buffer.get(base).toInt() and 0xFF
+                val left = buffer.get(base - 2 * pxStride).toInt() and 0xFF
+                val right = buffer.get(base + 2 * pxStride).toInt() and 0xFF
+                val up = buffer.get(base - 2 * rowStride).toInt() and 0xFF
+                val down = buffer.get(base + 2 * rowStride).toInt() and 0xFF
+                val lap = (center - left).toDouble() + (center - right) +
+                    (center - up) + (center - down)
+                sum += lap * lap
+                count++
+                x += SAMPLE_STRIDE
+            }
+            y += SAMPLE_STRIDE
+        }
+        return if (count == 0) 0.0 else sum / count
+    }
+
     companion object {
         const val ZSL_DEPTH = 4
         const val MAX_TRACKED_RESULTS = 12
         const val SETTLE_MS = 250L
         const val SAMPLE_STRIDE = 8
         private const val FPS_WINDOW_NS = 2_000_000_000L
+
+        /** Cap the YUV fallback merge so low-end SoCs stay interactive (~8 MP). */
+        const val MAX_YUV_MERGE_PIXELS = 8_400_000L
 
         /** High-res sensors eat hundreds of MB per frame; shrink the queue instead. */
         fun queueDepthFor(rawSize: Size): Int {

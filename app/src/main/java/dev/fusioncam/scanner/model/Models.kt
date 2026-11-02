@@ -5,8 +5,8 @@ import android.util.SizeF
 enum class Tier(val label: String, val minScore: Int) {
     A("A · HDR+ full pipeline target", 85),
     B("B · Pipeline supported, needs tuning", 70),
-    C("C · Degraded pipeline (fewer frames / sYCC merge)", 50),
-    D("D · Not supported (no RAW / LEGACY HAL)", 0);
+    C("C · Degraded pipeline (fewer frames / YUV merge)", 50),
+    D("D · No RAW — YUV fallback merge only", 0);
 
     companion object {
         fun fromScore(score: Int): Tier = when {

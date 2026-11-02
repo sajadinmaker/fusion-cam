@@ -55,6 +55,38 @@ static void makeFrame(std::vector<u16>& out, int shiftX, int shiftY,
 
 static int groundTruthLevel0(int expectedLevel0) { return expectedLevel0; }
 
+// 8-bit luma scene for the YUV fallback test — same structure contract as
+// sceneValue (blocky, no periodic aliasing, one unique dot per 32px tile) but
+// with the dot sized so its signal survives the 2x2 block mean: dot is ≥92
+// levels above its block, so the level-0 dot signal is ≥23 vs σ 1.5 — the
+// same SNR class that lets the 16-bit fixture lock all tiles.
+static u16 sceneValueYuv(int x, int y) {
+    const int bx = (x / 32) & 3, by = (y / 32) & 3;
+    const u16 blockVal[] = {40, 70, 105, 140};
+    u16 v = blockVal[(bx + by) & 3];
+    if (x > 60 && x < 64) v = 237; // vertical high-contrast edge
+    const int tx = x / 32, ty = y / 32;
+    const int dotX = tx * 32 + 4 + (tx * 7 + ty * 5) % 16;
+    const int dotY = ty * 32 + 4 + (ty * 11 + tx * 3) % 16;
+    if (x == dotX && y == dotY) v = 232;
+    return v;
+}
+
+static void makeFrameYuv(std::vector<u16>& out, int shiftX, int shiftY,
+                         float sigma, std::mt19937& rng) {
+    std::normal_distribution<float> noise(0.0f, sigma);
+    out.assign(static_cast<size_t>(W) * H, 0);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            const int sx = std::min(std::max(x + shiftX, 0), W - 1);
+            const int sy = std::min(std::max(y + shiftY, 0), H - 1);
+            const float v = sceneValueYuv(sx, sy) + noise(rng);
+            out[static_cast<size_t>(y) * W + x] =
+                static_cast<u16>(std::max(0.0f, std::min(v, 245.0f)));
+        }
+    }
+}
+
 int main() {
     const int clipThresh = (kWhite - kBlack) * 98 / 100;
     std::mt19937 rng(1234);
@@ -108,7 +140,8 @@ int main() {
     std::vector<u16> merged(ref); // pre-filled from ref, as in the JNI entry
     std::vector<u16*> alts = {alt1.data(), alt2.data()};
     std::vector<AlignOffsets> offs = {o1, o2};
-    mergeThreaded(ref.data(), alts, offs, W, H, clipThresh, kTau, merged.data());
+    mergeThreaded(ref.data(), alts, offs, W, H, clipThresh, kTau, kGhostDiscard,
+                  merged.data());
 
     auto variance = [&](const std::vector<u16>& img, int x0, int y0, int x1, int y1) {
         double sum = 0, sum2 = 0; long n = 0;
@@ -171,7 +204,7 @@ int main() {
         std::vector<u16> hiMerged(hiRef);
         std::vector<u16*> hiAlts = {hiA1.data(), hiA2.data()};
         mergeThreaded(hiRef.data(), hiAlts, {hiO1, hiO2}, W, H, clipThresh,
-                      kTau * 16.0f, hiMerged.data());
+                      kTau * 16.0f, kGhostDiscard, hiMerged.data());
         int hiBad = 0;
         for (size_t i = 0; i < hiO1.dy.size(); i++) {
             if (hiO1.dy[i] != kNoMatch &&
@@ -199,6 +232,57 @@ int main() {
         if (hiVarMerged > 0.45 * hiVarRef) {
             printf("FAIL: scaled tau not effective (merge ratio %.2f, want <=0.45)\n",
                    hiVarMerged / hiVarRef);
+            failures++;
+        }
+    }
+
+    // ---- 6. YUV fallback path: luma merge + BT.601 conversion ----------------
+    // Native 8-bit luma frames (σ 1.5); chroma planes are flat 128. The same
+    // pyramid/align/merge machinery must recover alignment truth and denoise
+    // on Y, and flat chroma must convert to a near-gray pixel.
+    {
+        std::mt19937 rng3(777);
+        std::vector<u16> yRef, yA1, yA2;
+        makeFrameYuv(yRef, 0, 0, 1.5f, rng3);
+        makeFrameYuv(yA1, 2, 0, 1.5f, rng3);  // full-res +2 x -> level-0 offset (-1, 0)
+        makeFrameYuv(yA2, 0, 4, 1.5f, rng3);  // full-res +4 y -> level-0 offset (0, -2)
+        std::vector<u8> uRef(static_cast<size_t>(W / 2) * (H / 2), 128);
+        std::vector<u8> vRef(static_cast<size_t>(W / 2) * (H / 2), 128);
+
+        const GrayPyramid ygRef = buildGray(yRef.data(), W, H, kClipYuv);
+        const AlignOffsets yo1 = align(ygRef, buildGray(yA1.data(), W, H, kClipYuv));
+        const AlignOffsets yo2 = align(ygRef, buildGray(yA2.data(), W, H, kClipYuv));
+        int yBad = 0;
+        for (size_t i = 0; i < yo1.dy.size(); i++) {
+            if (yo1.dy[i] != kNoMatch &&
+                (std::abs(yo1.dx[i] + 1) > 1 || std::abs(yo1.dy[i]) > 1)) yBad++;
+            if (yo2.dy[i] != kNoMatch &&
+                (std::abs(yo2.dx[i]) > 1 || std::abs(yo2.dy[i] + 2) > 1)) yBad++;
+        }
+        printf("yuv align: tiles off-truth beyond ±1: %d / %zu\n", yBad, yo1.dy.size() * 2);
+        if (yBad > 0) failures++;
+
+        std::vector<u16> yMerged(yRef);
+        std::vector<u16*> yAlts = {yA1.data(), yA2.data()};
+        const float yTau = kTauYuv;
+        mergeThreaded(yRef.data(), yAlts, {yo1, yo2}, W, H, kClipYuv, yTau,
+                      kGhostTauMultiple * yTau, yMerged.data());
+        const double yVarRef = variance(yRef, 8, 16, 24, 32);
+        const double yVarMerged = variance(yMerged, 8, 16, 24, 32);
+        printf("yuv noise variance: ref=%.1f merged=%.1f\n", yVarRef, yVarMerged);
+        if (yVarMerged >= yVarRef * 0.75) {
+            printf("FAIL: yuv insufficient denoise\n");
+            failures++;
+        }
+
+        std::vector<jint> yPix(static_cast<size_t>(W) * H);
+        yuvToRgb(yMerged.data(), uRef.data(), vRef.data(), W, H, yPix.data());
+        jint yc = yPix[static_cast<size_t>(H / 2) * W + W / 2];
+        const int yr = (yc >> 0) & 0xFF, ygc = (yc >> 8) & 0xFF, yb = (yc >> 16) & 0xFF;
+        printf("yuv convert center R=%d G=%d B=%d (flat chroma -> near-gray)\n", yr, ygc, yb);
+        const int mid = (yr + ygc + yb) / 3;
+        if (std::abs(yr - mid) > 12 || std::abs(ygc - mid) > 12 || std::abs(yb - mid) > 12) {
+            printf("FAIL: flat chroma should stay near-gray\n");
             failures++;
         }
     }
